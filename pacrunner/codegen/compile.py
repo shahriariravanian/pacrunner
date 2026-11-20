@@ -219,9 +219,9 @@ def compile_op(w: CodeWriter, op: LOp, prog: Lowered, b: ArenaIndex) -> None:
     elif is_kernel(o):
         (s, set_) = prog.instances[op.t]
         stub = prog.stubs[s]
-        args = ", ".join(kernel_arg(i, op, prog, b, prog.scalesets[set_]) for i in stub.inputs)
-        direct = 1 if o == Opcode.KERNEL_DIRECT else 0
-        w.emit(f"adapter_{stub.kernel.name}({p(op.d)}, {args}, outputs{s + 1}, {direct}, {c_mode(op)}, &{factor(op.x)});")
+        args = [p(op.d), *(kernel_arg(i, op, prog, b, prog.scalesets[set_]) for i in stub.inputs), f"outputs{s + 1}",
+                "1" if o == Opcode.KERNEL_DIRECT else "0", c_mode(op), f"&{factor(op.x)}"]   # a stub may have no inputs
+        w.emit(f"adapter_{stub.kernel.name}({', '.join(args)});")
     else:
         raise CompileError(f"unknown opcode {o.name}")
 

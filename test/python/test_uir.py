@@ -68,6 +68,25 @@ class Fixture(unittest.TestCase):
         with self.assertRaises(uir.InvalidLowered):
             uir.validate(dataclasses.replace(l, ops=l.ops + (LOp(Opcode.END),)))
 
+    def test_validate_refuses_legs(self):
+        l = self.ls[0]
+        crossing = tuple((k, 1.0) for k in range(l.legs))
+        uir.validate(dataclasses.replace(l, crossing=crossing))
+        for bad in (crossing[:-1] + ((l.legs, 1.0),), crossing[:-1] + ((-1, 1.0),), crossing[:-1] + ((0, 1.0),),
+                    crossing[:-1]):
+            with self.assertRaises(uir.InvalidLowered):
+                uir.validate(dataclasses.replace(l, crossing=bad))
+        forms = (uir.Form(((l.legs, 1.0),)),) + l.forms[1:]
+        with self.assertRaises(uir.InvalidLowered):
+            uir.validate(dataclasses.replace(l, forms=forms))
+
+    def test_export_refuses_a_crossing_off_the_legs(self):
+        d = uir.read_export(FIXTURE_EXPORTS / "pp_3j.json")
+        p = next(p for p in d["programs"] if p["crossing"])
+        p["crossing"][-1]["program_leg"] = -1
+        with self.assertRaises(uir.ExportError):
+            uir.load_recurrence_export(d)
+
     def test_wide_rows_round_trip(self):
         # a row whose indices need the second word, and one with a null operand
         rows = [LOp(Opcode.V_THREE_VECTOR, set=True, first=True, last=True, d=9000, t=2000, l=8191, r=1, x=63),

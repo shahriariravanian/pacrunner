@@ -301,6 +301,22 @@ def read_mir(application: Union[bytes, "os.PathLike", str]) -> Mir:
     return parse_mir(symjit.mir_json(application, "json-complex"))
 
 
+def symjit_fingerprint() -> Optional[str]:
+    """symjit's native library (the file mir_json runs in) as a hash, the first 16 hex digits of its
+    SHA-256: another symjit, another fingerprint (its package metadata need not be the one imported);
+    None without symjit"""
+    try:
+        import symjit
+    except ImportError:
+        return None
+    import hashlib
+    from pathlib import Path
+    h = hashlib.sha256()
+    for lib in sorted(Path(symjit.__file__).parent.glob("_lib*")):
+        h.update(lib.read_bytes())
+    return h.hexdigest()[:16]
+
+
 def listing(mir: Mir) -> str:
     """the code, one instruction a line numbered from 0 (for messages and dumps)"""
     return "".join(f"{k:05d}\t{i}\n" for k, i in enumerate(mir.code))

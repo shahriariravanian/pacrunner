@@ -179,6 +179,11 @@ class HandMade(unittest.TestCase):
         call = [{"Call": {"label": "sin", "num_args": 1}}]
         with self.assertRaises(kernels.KernelCError):
             kernels.kernel_c("k", kernels.parse_mir(_mir_json(call)))
+        fused = [{"Fused": {"op": "Frobnicate", "dst": {"Gen": 0}, "a": {"Gen": 0}, "b": {"Gen": 0}, "c": {"Gen": 0}}}]
+        for f in (kernels.kernel_c, kernels.kernel_c_mixed):   # an unknown operation: an error naming it, not a KeyError
+            with self.assertRaises((kernels.KernelCError, kernels.MirError)) as e:
+                f("k", kernels.parse_mir(_mir_json(fused)))
+            self.assertIn("Frobnicate", str(e.exception))
         with self.assertRaises(kernels.MirError):
             kernels.parse_mir(_mir_json([{"Frobnicate": {}}]))
         with self.assertRaises(kernels.MirError):

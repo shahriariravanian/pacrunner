@@ -10,11 +10,14 @@ skipped without them, or without symjit >= 2.29.
 """
 
 import ctypes
+import io
 import json
+import os
 import shutil
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from goldens import bits, first_difference, golden_sets
 
@@ -77,6 +80,22 @@ class Goldens(unittest.TestCase):
                 with self.assertRaises(AttributeError):   # every other symbol hidden
                     so.run
 
+    def test_an_export_already_read(self):
+        (name, folder, export, m) = min(UMAMI_SETS, key=lambda s: s[3]["umami_libraries"])
+        with tempfile.TemporaryDirectory() as out:   # `true` for cc: the sources only
+            table = json.loads(Path(umami.umami_libraries(uir.read_export(export), m["metadata"], out, cc="true",
+                                                          quiet=True)).read_text())
+            self.assertIsNone(table["export"])
+            self.assertEqual(len(table["libraries"]), m["umami_libraries"])
+
+    def test_the_first_failure_stops_the_build(self):
+        (name, folder, export, m) = max(UMAMI_SETS, key=lambda s: s[3]["umami_libraries"])
+        with tempfile.TemporaryDirectory() as out:
+            with self.assertRaises(umami.UmamiError):
+                umami.umami_libraries(export, m["metadata"], out, cc="false", jobs=1, quiet=True)
+            built = list((Path(out) / "programs").iterdir())
+            self.assertLess(len(built), m["umami_libraries"])   # the pending ones cancelled
+
 
 class Units(unittest.TestCase):
     def test_permuted(self):
@@ -89,6 +108,32 @@ class Units(unittest.TestCase):
             self.assertEqual(crossed.crossing, tuple((p[leg], s) for (leg, s) in l.crossing))
         with self.assertRaises(umami.UmamiError):
             umami.permuted(l, [0] * l.legs)
+
+    def test_replace_copy_keeps_an_open_file(self):
+        with tempfile.TemporaryDirectory() as d:
+            (src, dst) = (Path(d) / "new", Path(d) / "lib.so")
+            src.write_bytes(b"new")
+            dst.write_bytes(b"old")
+            with open(dst, "rb") as held:   # a process that has the library loaded
+                umami._replace_copy(src, dst)
+                self.assertEqual(held.read(), b"old")
+            self.assertEqual(dst.read_bytes(), b"new")
+            self.assertEqual(sorted(p.name for p in Path(d).iterdir()), ["lib.so", "new"])
+
+    def test_find_cc_takes_arguments(self):
+        with mock.patch.dict(os.environ, {"CC": "env cc -m64"}):
+            self.assertEqual(umami.find_cc(), "env cc -m64")
+        with mock.patch.dict(os.environ, {"CC": "no-such-compiler-xyz -O2"}):
+            self.assertIsNone(umami.find_cc())
+
+    def test_errors_before_any_work(self):
+        with self.assertRaises(umami.UmamiError):   # fmad: before the export is read or nvcc runs
+            umami.umami_libraries("/nonexistent", "/nonexistent", "/nonexistent", device="cuda", fmad=True)
+
+    def test_cli_error_is_exit_1(self):
+        with mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+            self.assertEqual(umami.main(["/nonexistent.json", "/nonexistent.json", "/nonexistent", "--fmad"]), 1)
+        self.assertIn("fmad", err.getvalue())
 
     def test_devices(self):
         self.assertEqual(umami.device_name("cuda_full"), "cuda_provider")

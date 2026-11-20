@@ -112,6 +112,17 @@ def _table_problems(out: list[str], l: Lowered) -> None:
                 out.append(f"embedding {k}: entry ({j}, {w}, {x}) out of range")
         if len({j for (j, _, _) in entries}) != len(entries):
             out.append(f"embedding {k} writes a component twice")
+    for k, form in enumerate(l.forms):
+        for (leg, _) in form.terms:
+            if not _inrange(leg, l.legs):
+                out.append(f"form {k}: leg {leg} is not one of the {l.legs} legs")
+    if l.crossing is not None:
+        if len(l.crossing) != l.legs:
+            out.append(f"the crossing has {len(l.crossing)} legs, the program {l.legs}")
+        if any(not _inrange(leg, l.legs) for (leg, _) in l.crossing):
+            out.append(f"the crossing names a caller leg outside the {l.legs} legs")
+        elif len({leg for (leg, _) in l.crossing}) != len(l.crossing):
+            out.append("the crossing names a caller leg twice")
 
 
 def _row_edges_ok(l: Lowered, op: LOp) -> bool:

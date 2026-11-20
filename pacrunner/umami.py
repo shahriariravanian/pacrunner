@@ -147,8 +147,25 @@ def _flags(f: Flags) -> list[str]:
 
 
 def find_cc() -> Optional[str]:
-    c = os.environ.get("CC", "cc")
-    return c if shutil.which(c) else None
+    """CC (a command, possibly with arguments: "ccache gcc") when its program is found, else None"""
+    c = os.environ.get("CC") or "cc"
+    words = shlex.split(c)
+    return c if words and shutil.which(words[0]) else None
+
+
+def _replace_copy(src, dst) -> None:
+    """copy `src` to `dst` as a new file (written beside it, then renamed): a process that has the old
+    `dst` loaded (a shared library) keeps its own copy instead of reading a truncated one"""
+    dst = Path(dst)
+    with tempfile.NamedTemporaryFile(dir=dst.parent, prefix=f".{dst.name}.", delete=False) as f:
+        tmp = f.name
+    try:
+        shutil.copyfile(src, tmp)
+        os.chmod(tmp, 0o755)
+        os.replace(tmp, dst)
+    except BaseException:
+        os.unlink(tmp)
+        raise
 
 
 def find_nvcc() -> Optional[str]:
@@ -207,7 +224,7 @@ def build_cuda_runtime(dir, nvcc: Optional[str] = None, cuda_arch: str = "native
     cudart = find_cudart(nvcc)
     m = re.match(r"(libcudart\.so\.\d+)", os.path.basename(cudart))
     copy = dir / (m.group(1) if m else os.path.basename(cudart))
-    shutil.copyfile(cudart, copy)
+    _replace_copy(cudart, copy)
     if not pool:
         return str(copy)
     shutil.copyfile(C_DIR / "pool.h", dir / "pool.h")
@@ -241,7 +258,7 @@ def build_umami_library(dir, lib: UmamiLibrary, l: Lowered, provider: dict, expo
         raise UmamiError(f"precision = {precision} needs device = cuda or cuda_provider")
     if fmad and precision == "f64":
         raise UmamiError("fmad = True is not the CPU's bits: precision = mixed only")
-    cc = cc or find_cc() or "cc"
+    cc = _flags(cc or find_cc() or "cc")   # a command, possibly with arguments
     nvcc = nvcc or find_nvcc()
     if cuda and nvcc is None:
         raise UmamiError("a CUDA device needs nvcc (NVCC, the PATH or /usr/local/cuda/bin)")
@@ -273,14 +290,14 @@ def build_umami_library(dir, lib: UmamiLibrary, l: Lowered, provider: dict, expo
         _run([nvcc, *_flags(nvflags), f"-arch={cuda_arch}", f"--fmad={'true' if fmad else 'false'}", *mixed, "-Xcompiler",
               "-fPIC,-fvisibility=hidden", *gpu, f"-DUIRGPU_SLOT_BYTES={int(gpu_memory)}", "-x", "cu", "-c", "-o",
               dir / "runner_gpu.o", dir / "runner.c"])
-        _run([cc, *cflags, "-std=c99", "-ffp-contract=off", "-fPIC", "-fvisibility=hidden",
+        _run([*cc, *cflags, "-std=c99", "-ffp-contract=off", "-fPIC", "-fvisibility=hidden",
               "-DPAC_CUDA_PROVIDER" if provider_build else "-DPAC_CUDA", "-c", "-o", dir / "umami_pac.o", dir / "umami_pac.c"])
         pool = [] if provider_build else [f"-L{runtime_dir}", "-lpacpool"]
         _run([nvcc, "-shared", f"-arch={cuda_arch}", "-cudart", "shared", "-o", so, dir / "umami_pac.o", dir / "runner_gpu.o",
               *pool, "-Xlinker", "-rpath", "-Xlinker", rpath, "-lm"])
     else:
         sources = [dir / f for f in ("umami_pac.c", "runner.c", "pacops.c")]
-        _run([cc, *cflags, "-std=c99", "-ffp-contract=off", "-fPIC", "-fvisibility=hidden", "-shared", "-o", so, *sources, "-lm"])
+        _run([*cc, *cflags, "-std=c99", "-ffp-contract=off", "-fPIC", "-fvisibility=hidden", "-shared", "-o", so, *sources, "-lm"])
     return str(so)
 
 
@@ -385,13 +402,16 @@ def umami_libraries(export, metadata, dir, *, optimize_programs: bool = True, in
     if precision != "f64" and device not in ("cuda", "cuda_provider"):
         raise UmamiError(f"precision = {precision} needs device = cuda or cuda_provider")
     fmad = precision == "mixed" if fmad is None else fmad
+    if fmad and precision == "f64":
+        raise UmamiError("fmad = True is not the CPU's bits: precision = mixed only")
+    export_path = os.path.abspath(export) if isinstance(export, (str, os.PathLike)) else None   # or an export already read
     d = uir.read_export(export)
     meta = read_metadata(metadata, d)
     provider = meta["provider"]
     exported_count = len(meta["helicities"])
     parameters = export_parameters(d)
     programs = export_programs(d)
-    (libraries, channels) = provider_libraries(meta, programs, export)
+    (libraries, channels) = provider_libraries(meta, programs, export_path or "the export")
 
     dir = Path(dir).resolve()
     dir.mkdir(parents=True, exist_ok=True)
@@ -414,12 +434,18 @@ def umami_libraries(export, metadata, dir, *, optimize_programs: bool = True, in
             print(f"library {k} of {len(libraries)}: {lib.process} {lib.colour} {list(lib.permutation)}", flush=True)
         return so
 
+    # the first failure is raised at once: the builds not started yet are cancelled
     with ThreadPoolExecutor(jobs or os.cpu_count() or 1) as pool:
-        sos = list(pool.map(build, range(len(libraries))))
+        futures = [pool.submit(build, k) for k in range(len(libraries))]
+        try:
+            sos = [f.result() for f in futures]
+        except BaseException:
+            pool.shutdown(wait=True, cancel_futures=True)
+            raise
     table = {
         "kind": "pacrunner-umami-libraries", "schema_version": 1, "device": device, "precision": precision,
         "gpu_slots": gpu_slots if device == "cuda" else None, "gpu_memory": None if device == "cpu" else gpu_memory,
-        "artifact_id": d["artifact_id"], "export": os.path.abspath(export), "metadata": os.path.abspath(metadata),
+        "artifact_id": d["artifact_id"], "export": export_path, "metadata": os.path.abspath(metadata),
         "particle_count": provider["particle_count"],
         "libraries": [library_entry(k, lib, os.path.relpath(so, dir)) for k, (lib, so) in enumerate(zip(libraries, sos))],
         "channels": [{"flavor_libraries": fl, "libraries": sorted(set(fl))} for fl in channels],
@@ -430,10 +456,12 @@ def umami_libraries(export, metadata, dir, *, optimize_programs: bool = True, in
 
 
 def main(argv=None) -> int:
-    """python -m pacrunner.umami EXPORT METADATA DIR [--device D] [--precision P] [--interpreter]
-    [--imported] [--quiet]: umami_libraries from the command line (a python with pacrunner and symjit
-    >= 2.29, for scripts that run in another one, such as MadGraph7's); prints umami_pac.json's path"""
+    """python -m pacrunner.umami EXPORT METADATA DIR [options]: umami_libraries from the command line (a
+    python with pacrunner and symjit >= 2.29, for scripts that run in another one, such as MadGraph7's);
+    prints umami_pac.json's path (an error: its message, exit status 1). --help lists the options"""
     import argparse
+
+    from . import kernels
     ap = argparse.ArgumentParser(prog="python -m pacrunner.umami", description="PacRunner's UMAMI libraries of a provider")
     ap.add_argument("export")
     ap.add_argument("metadata")
@@ -443,9 +471,27 @@ def main(argv=None) -> int:
     ap.add_argument("--interpreter", action="store_true", help="the UIR interpreter's data instead of straight-line C")
     ap.add_argument("--imported", action="store_true", help="the programs as imported (not optimized)")
     ap.add_argument("--quiet", action="store_true")
+    ap.add_argument("--jobs", type=int, help="libraries built at a time (default: the CPUs)")
+    ap.add_argument("--cc", help="the C compiler, possibly with arguments (default: CC, else cc)")
+    ap.add_argument("--cflags", default="-O2", help="the C compiler's flags (default: -O2)")
+    ap.add_argument("--nvcc", help="nvcc (default: NVCC, the PATH, else /usr/local/cuda/bin/nvcc)")
+    ap.add_argument("--cuda-arch", default="native", help="nvcc's -arch (default: native, this machine's GPU)")
+    ap.add_argument("--nvflags", default="-O3", help="nvcc's flags (default: -O3)")
+    ap.add_argument("--gpu-slots", type=int, default=0, help="device cuda: the pool's slots (default 0: one per CPU)")
+    ap.add_argument("--gpu-memory", type=int, default=GPU_MEMORY_DEFAULT, help="the device bytes of a slot (or a launch)")
+    ap.add_argument("--fmad", action=argparse.BooleanOptionalAction, default=None,
+                    help="nvcc's contracted multiply-adds (default: with precision mixed only)")
     a = ap.parse_args(argv)
-    print(umami_libraries(a.export, a.metadata, a.dir, device=a.device, precision=a.precision, interpreter=a.interpreter,
-                          optimize_programs=not a.imported, quiet=a.quiet))
+    try:
+        path = umami_libraries(a.export, a.metadata, a.dir, device=a.device, precision=a.precision, interpreter=a.interpreter,
+                               optimize_programs=not a.imported, quiet=a.quiet, jobs=a.jobs, cc=a.cc, cflags=a.cflags,
+                               nvcc=a.nvcc, cuda_arch=a.cuda_arch, nvflags=a.nvflags, gpu_slots=a.gpu_slots,
+                               gpu_memory=a.gpu_memory, fmad=a.fmad)
+    except (UmamiError, uir.ExportError, uir.InvalidLowered, uir.EncodeError, codegen.CompileError, kernels.KernelCError,
+            kernels.MirError, OSError) as e:
+        print(f"python -m pacrunner.umami: {e}", file=sys.stderr)
+        return 1
+    print(path)
     return 0
 
 

@@ -204,7 +204,8 @@ class _Writer:
             f = BI_C.get(i.op) or refuse(f"{self.name}: the operation {i.op}")
             self.line(f"{self.used(i.dst)} = {f(self.used(i.s1), self.used(i.s2))};")
         elif isinstance(i, Fused):
-            self.line(f"{self.used(i.dst)} = {FUSED_C[i.op](self.used(i.a), self.used(i.b), self.used(i.c))};")
+            f = FUSED_C.get(i.op) or refuse(f"{self.name}: the operation {i.op}")
+            self.line(f"{self.used(i.dst)} = {f(self.used(i.a), self.used(i.b), self.used(i.c))};")
         elif isinstance(i, Mov):
             lhs = self.used(i.dst)
             self.assign(lhs, self.used(i.s1))
@@ -224,7 +225,8 @@ class _Writer:
             # the operand goes to Temp (complex) or Ret (real) first, as symjit replays it
             t = self.used(Reg("Temp" if self.complex else "Ret"))
             operand = self.at(i.loc) if isinstance(i, LoadMath) else const_c(self.mir.consts[i.idx])
-            self.line(f"{t} = {operand}; {self.used(i.dst)} = {BI_C[i.op](self.used(i.s1), t)};")
+            f = BI_C.get(i.op) or refuse(f"{self.name}: the operation {i.op}")
+            self.line(f"{t} = {operand}; {self.used(i.dst)} = {f(self.used(i.s1), t)};")
         elif isinstance(i, ComplexBi):
             self.complex_bi(i)
         elif isinstance(i, IfElse):
@@ -438,7 +440,8 @@ class _MixedWriter:
         elif isinstance(i, Bi):
             self.bi(i.op, reg_c(i.dst), reg_c(i.s1), reg_c(i.s2))
         elif isinstance(i, Fused):
-            self.arith(reg_c(i.dst), [reg_c(i.a), reg_c(i.b), reg_c(i.c)], MIXED_FUSED[i.op])
+            f = MIXED_FUSED.get(i.op) or refuse(f"{self.name}: the operation {i.op}")
+            self.arith(reg_c(i.dst), [reg_c(i.a), reg_c(i.b), reg_c(i.c)], f)
         elif isinstance(i, Mov):
             self.move(reg_c(i.dst), reg_c(i.s1))
         elif isinstance(i, Load):

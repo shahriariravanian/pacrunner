@@ -383,7 +383,10 @@ def _export_crossing(p, legs: int):
         return None
     out: list = [None] * legs
     for e in x:
-        out[int(e["program_leg"])] = (int(e["caller_leg"]), float(e["sign"]))
+        (leg, caller) = (int(e["program_leg"]), int(e["caller_leg"]))
+        if not (0 <= leg < legs and 0 <= caller < legs):
+            raise ExportError(f"{p['process_key']}: the crossing's leg {leg} → {caller} is not one of the {legs} legs")
+        out[leg] = (caller, float(e["sign"]))
     if any(v is None for v in out):
         raise ExportError(f"{p['process_key']}: the crossing misses a leg")
     return tuple(out)

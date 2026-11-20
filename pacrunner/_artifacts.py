@@ -211,17 +211,18 @@ class Artifact:
     def compile(self, folder=None, device="cpu", precision="f64", parameters=None, interpreter=False, force=False):
         """PacRunner's UMAMI libraries of this provider: the export (export()), then umami_libraries
         (pacrunner.umami) into `folder` (default: default_folder()); returns the Provider. Skipped when
-        `folder` holds libraries of the same artifact, provider, parameters, device, precision and
-        pacrunner revision (its pacrunner-build.json), unless `force`. device: "cpu", "cuda" (the GPU, a CPU
+        `folder` holds libraries of the same artifact, provider, parameters, device, precision, pacrunner
+        revision and symjit (its pacrunner-build.json), unless `force`. device: "cpu", "cuda" (the GPU, a CPU
         provider), "cuda_provider" or its alias "cuda_full" (MadSpace's GPU runtime); precision "f64" or
         "mixed" (the GPU)."""
+        from .kernels import symjit_fingerprint
         from .umami import umami_libraries
         device = _env.device_name(device)
         from ._libraries import Provider
         folder = Path(folder) if folder is not None else self.default_folder(device, precision)
         stamp = {"artifact_id": self.id, "provider": self.provider, "device": device, "precision": precision,
                  "interpreter": bool(interpreter), "parameters": dict(sorted((parameters or {}).items())),
-                 "pacrunner": _git_revision(_env.repository())}
+                 "pacrunner": _git_revision(_env.repository()), "symjit": symjit_fingerprint()}   # the kernels' C
         if not force and (folder / "umami_pac.json").is_file() and (folder / STAMP).is_file():
             if _read(folder / STAMP) == stamp and stamp["pacrunner"] is not None and not stamp["pacrunner"].endswith("+"):
                 return Provider(folder)
