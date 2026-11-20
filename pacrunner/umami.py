@@ -1,0 +1,453 @@
+"""UMAMI libraries for MadSpace, one per program (pac-julia's src/umami.jl): umami_libraries(export,
+metadata, dir) writes, for each (process, colour flow, leg permutation) a pyAmpliCol artifact's UMAMI
+provider uses (API/umami/metadata.json: its channels, each channel's flavours, each flavour one
+contribution), a shared library made of the program's compiled C (codegen.compile: runner.c, pacops.c)
+and c/umami_pac.c, a thin UMAMI layer: the permutation, the helicity tables, the factor, the colour
+index, the masses and the exported model parameters are constants of the library.
+
+The flavour splitting is MadSpace's: dir/umami_pac.json lists the libraries and, per channel, the
+library of each flavour (`flavor_libraries`) and the channel's libraries (`libraries`). An integrand
+per channel loads flavour f's library as a matrix element of its own, with one differential cross
+section per flavour:
+  flavor_diff_xs_indices[f] = f,
+  flavor_remap[f] = 0 (each library sees flavour 0),
+flavor_per_subproc_remap and flavor_subproc_indices as for the stock provider (the event output's
+flavour and subprocess ids). MadSpace splits each batch by flavour itself; a library never sees
+another flavour's events.
+
+device "cuda": the program runs on a CUDA GPU (the UIR interpreter, c/uirgpu.c, built by nvcc); the
+library still identifies as a CPU provider (host pointers, MadSpace's CPU threads).
+device "cuda_provider" (alias "cuda_full"): the library identifies as CUDA, for MadSpace's GPU runtime
+(its device pointers and stream; asynchronous, umami_pac.c).
+
+The programs come from RustiCol's recurrence export (uir.load_recurrence_export) of the same artifact,
+with the same model parameters: a library refuses other values (umami_set_parameter).
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Optional, Sequence, Union
+
+from . import codegen, uir
+from ._literal import julia_repr
+from .codegen.common import C_DIR, cstring
+from .codegen.compile_vm import GPU_MEMORY_DEFAULT
+from .uir import Lowered
+
+DEVICES = ("cpu", "cuda", "cuda_provider")   # cuda: on the GPU, a CPU provider; cuda_provider: a CUDA one
+DEVICE_ALIASES = {"cuda_full": "cuda_provider"}   # cuda_full: all on the GPU (MadSpace's GPU runtime)
+PRECISIONS = ("f64", "mixed")                 # a CUDA device: mixed is pacops.h's PAC_MIXED
+SO = "dylib" if sys.platform == "darwin" else "so"
+
+Flags = Union[str, Sequence[str]]
+
+
+class UmamiError(RuntimeError):
+    """a provider umami_libraries cannot build"""
+
+
+def device_name(device: str) -> str:
+    return DEVICE_ALIASES.get(device, device)
+
+
+@dataclass(frozen=True)
+class UmamiLibrary:
+    process: str                  # the provider's runtime process (the export's process_key)
+    colour: str                   # its colour flow (colour_id)
+    permutation: tuple            # runtime leg j = input leg permutation[j]
+    colour_index: int
+    factor: float
+    helicity_export: tuple        # runtime helicity → exported helicity
+
+
+def clit(x: float) -> str:
+    if x != x or x in (float("inf"), float("-inf")):
+        raise UmamiError(f"not finite: {x}")
+    return julia_repr(float(x))
+
+
+def permuted(l: Lowered, permutation: Sequence[int]) -> Lowered:
+    """`l` reading the caller's legs (MadSpace's order): the library's leg permutation (runtime leg j =
+    input leg permutation[j]) folded into the crossing, so program leg l is sign × the caller's leg
+    permutation[crossing leg] (× 1.0 without a crossing: the same bits). No gather in the library: the
+    form fill reads the caller's momenta as they are."""
+    if len(permutation) != l.legs:
+        raise UmamiError(f"{l.process} {l.colour}: a permutation of {len(permutation)} legs for {l.legs}")
+    if sorted(permutation) != list(range(l.legs)):
+        raise UmamiError(f"{l.process} {l.colour}: {list(permutation)} is not a permutation")
+    if l.crossing is None:
+        crossing = tuple((permutation[k], 1.0) for k in range(l.legs))
+    else:
+        crossing = tuple((permutation[leg], sign) for (leg, sign) in l.crossing)
+    return dataclasses.replace(l, crossing=crossing)
+
+
+def _jlist(v) -> str:
+    """a vector as Julia prints it: [0, 1, 2]"""
+    return "[" + ", ".join(str(x) for x in v) + "]"
+
+
+def umami_program_h(lib: UmamiLibrary, l: Lowered, provider: dict, exported_count: int, parameters) -> tuple[str, str]:
+    """umami_tables.h of `lib` (whose program is `l`): what umami_finish.h reads, on the CPU and the GPU
+    (its tables PAC_TABLE: __device__ under nvcc), and umami_program.h: the host's constants"""
+    what = f"{lib.process} {lib.colour}"
+    if exported_count <= 0:
+        raise UmamiError(f"{what}: the provider exports no helicities")
+    if not lib.helicity_export:
+        raise UmamiError(f"{what}: no runtime helicities")
+    runtime = [-1] * exported_count
+    for r, e in enumerate(lib.helicity_export):
+        if not 0 <= e < exported_count:
+            raise UmamiError(f"{what}: runtime helicity {r} is exported helicity {e}, not in 0:{exported_count - 1}")
+        if runtime[e] != -1:
+            raise UmamiError(f"{what}: exported helicity {e} is runtime helicity {runtime[e]} and {r}")
+        runtime[e] = r
+    (alpha_s0, power) = (0.0, None) if l.alpha_s is None else l.alpha_s
+    scales = power is not None and alpha_s0 > 0   # values at another alpha_s: × (alpha_s / alpha_s0)^power
+    masses = [float(m) for m in provider["masses"]]
+    tables = "".join(s + "\n" for s in [
+        f"/* {lib.process} {lib.colour}, permutation {_jlist(lib.permutation)} (in the program's crossing): "
+        "written by PacRunner's umami_libraries, included by umami_finish.h */",
+        f"#define PAC_PARTICLES {int(provider['particle_count'])}",
+        f"#define PAC_HELICITY_COUNT {int(provider['helicity_count'])}",
+        f"#define PAC_EXPORTED_HELICITY_COUNT {exported_count}",
+        f"#define PAC_COLOR_COUNT {int(provider['color_count'])}",
+        f"#define PAC_COLOR_INDEX {lib.colour_index}",
+        f"#define PAC_FACTOR {clit(lib.factor)}",
+        f"#define PAC_ALPHA_S_SCALES {int(scales)}",
+        f"#define PAC_ALPHA_S0 {clit(alpha_s0)}",
+        f"#define PAC_ALPHA_S_POWER {power if scales else 0}",
+        "PAC_TABLE int pac_helicity_runtime[] = {" + ", ".join(str(x) for x in runtime) + "};",
+        "PAC_TABLE int pac_helicity_export[] = {" + ", ".join(str(x) for x in lib.helicity_export) + "};",
+    ])
+    program = [f"/* {lib.process} {lib.colour}: written by PacRunner's umami_libraries (umami_tables.h: the rest) */",
+               "static const double pac_masses[] = {" + ", ".join(clit(m) for m in masses) + "};",
+               "static const PacParameter pac_parameters[] = {"]
+    program += [f"    {{{cstring(name)}, {clit(z.real)}, {clit(z.imag)}}}," for (name, z) in parameters]
+    program += ["    {NULL, 0.0, 0.0},", "};"]
+    return (tables, "".join(s + "\n" for s in program))
+
+
+# ---- the tools ------------------------------------------------------------------------------------------------
+
+def _flags(f: Flags) -> list[str]:
+    return shlex.split(f) if isinstance(f, str) else list(f)
+
+
+def find_cc() -> Optional[str]:
+    c = os.environ.get("CC", "cc")
+    return c if shutil.which(c) else None
+
+
+def find_nvcc() -> Optional[str]:
+    c = os.environ.get("NVCC") or shutil.which("nvcc") or "/usr/local/cuda/bin/nvcc"
+    return c if shutil.which(c) or os.path.isfile(c) else None
+
+
+def _run(args, cwd=None) -> None:
+    r = subprocess.run([os.fspath(a) for a in args], cwd=cwd, capture_output=True, text=True)
+    if r.returncode != 0:
+        raise UmamiError(f"{shlex.join(os.fspath(a) for a in args)} failed ({r.returncode}):\n{r.stdout}{r.stderr}")
+
+
+def nvcc_toolkit(nvcc: str) -> Optional[str]:
+    """the CUDA toolkit's folder as nvcc itself reports it (its `TOP`): right also when `nvcc` is a
+    wrapper script (Ubuntu's /usr/bin/nvcc execs a toolkit's nvcc); None if nvcc cannot say"""
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            src = Path(d) / "t.cu"
+            src.write_text("")
+            r = subprocess.run([nvcc, "--dryrun", "-c", str(src), "-o", str(Path(d) / "t.o")], capture_output=True, text=True)
+            if r.returncode != 0:
+                return None
+            out = r.stdout + r.stderr   # nvcc --dryrun prints its steps on stderr
+    except OSError:
+        return None
+    m = re.search(r"^#\$ TOP=(.*)$", out, re.M)
+    return os.path.normpath(m.group(1).strip()) if m else None
+
+
+def find_cudart(nvcc: str) -> str:
+    """the CUDA runtime library's file of nvcc's toolkit (libcudart.so.N, its soname): the toolkit nvcc
+    reports, else the folders next to nvcc"""
+    bin_ = os.path.dirname(shutil.which(nvcc) or nvcc)
+    tops = list(dict.fromkeys(t for t in (nvcc_toolkit(nvcc), os.path.join(bin_, "..")) if t))
+    tried = []
+    for top in tops:
+        for lib in (os.path.join(top, "lib64"), os.path.join(top, "targets", "x86_64-linux", "lib")):
+            tried.append(os.path.normpath(lib))
+            if not os.path.isdir(lib):
+                continue
+            names = sorted(f for f in os.listdir(lib) if re.fullmatch(r"libcudart\.so\.\d+", f))
+            if names:
+                return os.path.realpath(os.path.join(lib, names[0]))   # the file it links to
+    raise UmamiError(f"no libcudart.so.N in the CUDA toolkit of {nvcc} (looked in {', '.join(tried)}); "
+                     "set NVCC to the toolkit's nvcc, e.g. NVCC=/usr/local/cuda/bin/nvcc")
+
+
+def build_cuda_runtime(dir, nvcc: Optional[str] = None, cuda_arch: str = "native", pool: bool = True) -> str:
+    """the process-wide GPU pool (pool.cu) in `dir`: libpacpool.so, with a copy of the CUDA runtime it
+    and the program libraries share (libcudart.so.N, found through rpath $ORIGIN). pool = False (the
+    CUDA provider, which runs on the caller's stream): the runtime copy alone."""
+    nvcc = nvcc or find_nvcc() or "nvcc"
+    dir = Path(dir)
+    so = dir / f"libpacpool.{SO}"
+    cudart = find_cudart(nvcc)
+    m = re.match(r"(libcudart\.so\.\d+)", os.path.basename(cudart))
+    copy = dir / (m.group(1) if m else os.path.basename(cudart))
+    shutil.copyfile(cudart, copy)
+    if not pool:
+        return str(copy)
+    shutil.copyfile(C_DIR / "pool.h", dir / "pool.h")
+    _run([nvcc, "-O3", f"-arch={cuda_arch}", "-shared", "-Xcompiler", "-fPIC", "-cudart", "shared", "-Xlinker",
+          f"-soname=libpacpool.{SO}", "-Xlinker", "-rpath", "-Xlinker", "$ORIGIN", f"-I{dir}", "-o", so, C_DIR / "pool.cu"])
+    return str(so)
+
+
+def build_umami_library(dir, lib: UmamiLibrary, l: Lowered, provider: dict, exported_count: int, parameters, *,
+                        cc: Optional[str] = None, cflags: Flags = ("-O2",), interpreter: bool = False, device: str = "cpu",
+                        nvcc: Optional[str] = None, cuda_arch: str = "native", nvflags: Flags = ("-O3",),
+                        gpu_memory: int = GPU_MEMORY_DEFAULT, gpu_slots: int = 0, precision: str = "f64",
+                        fmad: Optional[bool] = None, runtime_dir=None) -> str:
+    """The shared library of `lib` in `dir` (codegen.compile's folder plus the UMAMI layer). device
+    "cuda": the interpreter's runner.c built by nvcc for `cuda_arch` (--fmad=false: the CPU's bits), on
+    the process-wide GPU slot pool of libpacpool.so in `runtime_dir` (built there if missing; one CUDA
+    runtime, libcudart.so.N, shared through rpath); every symbol but the UMAMI functions hidden. The
+    pool the library asks for (the first library of a process decides): `gpu_slots` slots (0: one per
+    CPU) of `gpu_memory` device bytes each (a call needing more runs as several launches). precision
+    "mixed" (a CUDA device only): pacops.h's PAC_MIXED, not the CPU's bits, so nvcc may contract
+    multiply-adds unless fmad = False."""
+    device = device_name(device)
+    if device not in DEVICES:
+        raise UmamiError(f"device {device}: one of {DEVICES} (or {', '.join(DEVICE_ALIASES)})")
+    if precision not in PRECISIONS:
+        raise UmamiError(f"precision {precision}: one of {PRECISIONS}")
+    fmad = precision == "mixed" if fmad is None else fmad
+    cuda = device in ("cuda", "cuda_provider")
+    provider_build = device == "cuda_provider"
+    if precision != "f64" and not cuda:
+        raise UmamiError(f"precision = {precision} needs device = cuda or cuda_provider")
+    if fmad and precision == "f64":
+        raise UmamiError("fmad = True is not the CPU's bits: precision = mixed only")
+    cc = cc or find_cc() or "cc"
+    nvcc = nvcc or find_nvcc()
+    if cuda and nvcc is None:
+        raise UmamiError("a CUDA device needs nvcc (NVCC, the PATH or /usr/local/cuda/bin)")
+    if int(provider["particle_count"]) != l.legs:
+        raise UmamiError(f"{lib.process} {lib.colour}: the provider has {provider['particle_count']} particles, "
+                         f"the program {l.legs} legs")
+    dir = Path(dir)
+    runtime_dir = Path(runtime_dir) if runtime_dir is not None else dir
+    l = permuted(l, lib.permutation)   # the library reads the caller's legs
+    codegen.compile(dir, l, interpreter=interpreter or cuda)
+    (tables, program) = umami_program_h(lib, l, provider, exported_count, parameters)
+    (dir / "umami_tables.h").write_text(tables, encoding="utf-8")
+    (dir / "umami_program.h").write_text(program, encoding="utf-8")
+    for f in ("umami_pac.c", "umami_finish.h", "umami.h"):
+        shutil.copyfile(C_DIR / f, dir / f)
+    so = dir / f"libumami_pac.{SO}"
+    cflags = _flags(cflags)
+    if cuda:
+        if provider_build:
+            if not any(f.startswith("libcudart.so") for f in os.listdir(runtime_dir)):
+                build_cuda_runtime(runtime_dir, nvcc, cuda_arch, pool=False)
+        elif not (runtime_dir / f"libpacpool.{SO}").is_file():
+            build_cuda_runtime(runtime_dir, nvcc, cuda_arch)
+        rpath = "$ORIGIN/" + os.path.relpath(runtime_dir.resolve(), dir.resolve())
+        mixed = ["-DPAC_MIXED"] if precision == "mixed" else []
+        # the CPU provider runs on the slot pool (libpacpool.so); the CUDA provider on the caller's
+        # stream (gpu_memory: the workspace budget of a launch), with the same CUDA runtime copy
+        gpu = ["-DUIRGPU_PROVIDER"] if provider_build else ["-DPACPOOL_EXTERNAL", "-DUIRGPU_UMAMI", f"-DUIRGPU_SLOTS={gpu_slots}"]
+        _run([nvcc, *_flags(nvflags), f"-arch={cuda_arch}", f"--fmad={'true' if fmad else 'false'}", *mixed, "-Xcompiler",
+              "-fPIC,-fvisibility=hidden", *gpu, f"-DUIRGPU_SLOT_BYTES={int(gpu_memory)}", "-x", "cu", "-c", "-o",
+              dir / "runner_gpu.o", dir / "runner.c"])
+        _run([cc, *cflags, "-std=c99", "-ffp-contract=off", "-fPIC", "-fvisibility=hidden",
+              "-DPAC_CUDA_PROVIDER" if provider_build else "-DPAC_CUDA", "-c", "-o", dir / "umami_pac.o", dir / "umami_pac.c"])
+        pool = [] if provider_build else [f"-L{runtime_dir}", "-lpacpool"]
+        _run([nvcc, "-shared", f"-arch={cuda_arch}", "-cudart", "shared", "-o", so, dir / "umami_pac.o", dir / "runner_gpu.o",
+              *pool, "-Xlinker", "-rpath", "-Xlinker", rpath, "-lm"])
+    else:
+        sources = [dir / f for f in ("umami_pac.c", "runner.c", "pacops.c")]
+        _run([cc, *cflags, "-std=c99", "-ffp-contract=off", "-fPIC", "-fvisibility=hidden", "-shared", "-o", so, *sources, "-lm"])
+    return str(so)
+
+
+# ---- the provider ---------------------------------------------------------------------------------------------
+
+def export_programs(d: dict) -> dict:
+    """the export's programs by (process_key, colour_id), each with its helicity ids"""
+    ls = uir.load_recurrence_export(d)
+    return {(l.process, l.colour): (l, [str(h["id"]) for h in p["helicity_outputs"]]) for l, p in zip(ls, d["programs"])}
+
+
+def flavour_library(r: dict, procs, programs: dict, export_path, place: str) -> UmamiLibrary:
+    """the library of one flavour of a channel (`r`: its runtime entry in the metadata), checked
+    against its program: the helicities are the provider's in order, one exported helicity per output"""
+    proc = procs[int(r["process_index"])]
+    lib = UmamiLibrary(str(proc["id"]), str(r["color_id"]), tuple(int(x) for x in r["permutation"]), int(r["color_index"]),
+                       float(r["factor"]), tuple(int(x) for x in r["helicity_export"]))
+    if (lib.process, lib.colour) not in programs:
+        raise UmamiError(f"{place}: no program {lib.process} {lib.colour} in {export_path}")
+    (l, ids) = programs[(lib.process, lib.colour)]
+    if ids != [str(h) for h in proc["helicity_ids"]]:
+        raise UmamiError(f"{lib.process} {lib.colour}: the export's helicities are not the provider's, in order")
+    if len(lib.helicity_export) != l.output_count():
+        raise UmamiError(f"{lib.process} {lib.colour}: {len(lib.helicity_export)} exported helicities for "
+                         f"{l.output_count()} outputs")
+    return lib
+
+
+def provider_libraries(meta: dict, programs: dict, export_path) -> tuple[list, list]:
+    """the provider's distinct libraries, and per channel each flavour's library (an index into them)"""
+    procs = meta["runtime_processes"]
+    libraries: list[UmamiLibrary] = []
+    index: dict = {}
+    channels = []
+    for c, channel in enumerate(meta["channels"]):
+        fl = []
+        for f, flavour in enumerate(channel["processes"]):
+            lib = flavour_library(flavour["runtime"], procs, programs, export_path, f"channel {c} flavour {f}")
+            if lib not in index:
+                index[lib] = len(libraries)
+                libraries.append(lib)
+            fl.append(index[lib])
+        channels.append(fl)
+    return (libraries, channels)
+
+
+def library_entry(k: int, lib: UmamiLibrary, path: str) -> dict:
+    """a library's entry of umami_pac.json (its path relative to the table)"""
+    return {"index": k, "path": path, "process": lib.process, "colour": lib.colour, "permutation": list(lib.permutation),
+            "colour_index": lib.colour_index, "factor": lib.factor}
+
+
+def read_metadata(metadata_path, d: dict) -> dict:
+    """the artifact's UMAMI metadata, checked against the export"""
+    with open(metadata_path) as f:
+        meta = json.load(f)
+    if meta.get("kind") != "pyamplicol-umami-metadata":
+        raise UmamiError(f"{metadata_path}: not a pyAmpliCol UMAMI metadata file")
+    provider = meta["provider"]
+    if provider["artifact_id"] != d["artifact_id"]:
+        raise UmamiError(f"the export is of artifact {d['artifact_id']}, the metadata of {provider['artifact_id']}")
+    if provider["color_accuracy"] != "lc":
+        raise UmamiError(f"the provider is {provider['color_accuracy']}, not lc")
+    return meta
+
+
+def export_parameters(d: dict) -> list:
+    return [(str(p["name"]), complex(float(p["value"]["re"]), float(p["value"]["im"]))) for p in d["parameters"]]
+
+
+def umami_libraries(export, metadata, dir, *, optimize_programs: bool = True, interpreter: bool = False,
+                    cc: Optional[str] = None, cflags: Flags = ("-O2",), device: str = "cpu", cuda_arch: str = "native",
+                    nvcc: Optional[str] = None, gpu_slots: int = 0, gpu_memory: int = GPU_MEMORY_DEFAULT,
+                    precision: str = "f64", fmad: Optional[bool] = None, nvflags: Flags = ("-O3",), quiet: bool = False,
+                    jobs: Optional[int] = None) -> str:
+    """One UMAMI library per (process, colour flow, permutation) of the artifact's UMAMI provider
+    (`metadata`: the artifact's API/umami/metadata.json), its program from the recurrence export
+    `export` of the same artifact; written into `dir`, with `dir/umami_pac.json` (the libraries and
+    each channel's flavours, for MadSpace). Returns the path of umami_pac.json.
+
+    `optimize_programs`: the programs after uir.optimize (the default; the same values) or as imported.
+    `interpreter`: each program as the UIR interpreter's data instead of straight-line C; `cc` and
+    `cflags` build the libraries. `device = "cuda"`: each program runs on a CUDA GPU (the interpreter,
+    built by `nvcc` for `cuda_arch`, default "native": this machine's GPU), the libraries still CPU
+    providers for MadSpace. The GPU memory and streams are a process-wide pool (`dir/libpacpool.so`,
+    with a copy of the CUDA runtime): `gpu_slots` slots (default 0: one per CPU; 1: one call at a time)
+    of `gpu_memory` device bytes each, allocated when first used (a call needing more runs as several
+    launches). `precision` (a CUDA device): "f64", RustiCol's values bit for bit, or "mixed": the
+    currents, their arithmetic and the vertex sums in f32, the momentum forms, propagator denominators,
+    wavefunctions and amplitudes in f64, the kernels in f32 but the backward slices of their
+    denominators (about 1e-7 relative on the matrix element); `nvflags` adds nvcc flags (-DPAC_ACC64:
+    the vertex sums in f64; -DPAC_AMP32: the amplitudes in f32); `fmad = False`: no contracted
+    multiply-adds. `device = "cuda_provider"` (alias "cuda_full"): the same GPU build, but each library
+    identifies as a CUDA provider for MadSpace's GPU runtime: device pointers, the caller's stream,
+    nothing synchronized; `gpu_memory` is then the workspace budget of one launch. The libraries are
+    built in parallel (`jobs` at a time; default: the CPUs)."""
+    device = device_name(device)
+    if device not in DEVICES:
+        raise UmamiError(f"device {device}: one of {DEVICES} (or {', '.join(DEVICE_ALIASES)})")
+    if precision not in PRECISIONS:
+        raise UmamiError(f"precision {precision}: one of {PRECISIONS}")
+    if precision != "f64" and device not in ("cuda", "cuda_provider"):
+        raise UmamiError(f"precision = {precision} needs device = cuda or cuda_provider")
+    fmad = precision == "mixed" if fmad is None else fmad
+    d = uir.read_export(export)
+    meta = read_metadata(metadata, d)
+    provider = meta["provider"]
+    exported_count = len(meta["helicities"])
+    parameters = export_parameters(d)
+    programs = export_programs(d)
+    (libraries, channels) = provider_libraries(meta, programs, export)
+
+    dir = Path(dir).resolve()
+    dir.mkdir(parents=True, exist_ok=True)
+    nvcc = nvcc or find_nvcc()
+    if device in ("cuda", "cuda_provider"):
+        if nvcc is None:
+            raise UmamiError("a CUDA device needs nvcc (NVCC, the PATH or /usr/local/cuda/bin)")
+        build_cuda_runtime(dir, nvcc, cuda_arch, pool=device == "cuda")
+
+    def build(k: int) -> str:
+        lib = libraries[k]
+        sub = dir / "programs" / f"{k:04d}"
+        sub.mkdir(parents=True, exist_ok=True)
+        l = programs[(lib.process, lib.colour)][0]
+        so = build_umami_library(sub, lib, uir.optimize(l) if optimize_programs else l, provider, exported_count, parameters,
+                                 cc=cc, cflags=cflags, interpreter=interpreter, device=device, cuda_arch=cuda_arch, nvcc=nvcc,
+                                 nvflags=nvflags, gpu_memory=gpu_memory, gpu_slots=gpu_slots, precision=precision, fmad=fmad,
+                                 runtime_dir=dir)
+        if not quiet:
+            print(f"library {k} of {len(libraries)}: {lib.process} {lib.colour} {list(lib.permutation)}", flush=True)
+        return so
+
+    with ThreadPoolExecutor(jobs or os.cpu_count() or 1) as pool:
+        sos = list(pool.map(build, range(len(libraries))))
+    table = {
+        "kind": "pacrunner-umami-libraries", "schema_version": 1, "device": device, "precision": precision,
+        "gpu_slots": gpu_slots if device == "cuda" else None, "gpu_memory": None if device == "cpu" else gpu_memory,
+        "artifact_id": d["artifact_id"], "export": os.path.abspath(export), "metadata": os.path.abspath(metadata),
+        "particle_count": provider["particle_count"],
+        "libraries": [library_entry(k, lib, os.path.relpath(so, dir)) for k, (lib, so) in enumerate(zip(libraries, sos))],
+        "channels": [{"flavor_libraries": fl, "libraries": sorted(set(fl))} for fl in channels],
+    }
+    path = dir / "umami_pac.json"
+    path.write_text(json.dumps(table, indent=2))
+    return str(path)
+
+
+def main(argv=None) -> int:
+    """python -m pacrunner.umami EXPORT METADATA DIR [--device D] [--precision P] [--interpreter]
+    [--imported] [--quiet]: umami_libraries from the command line (a python with pacrunner and symjit
+    >= 2.29, for scripts that run in another one, such as MadGraph7's); prints umami_pac.json's path"""
+    import argparse
+    ap = argparse.ArgumentParser(prog="python -m pacrunner.umami", description="PacRunner's UMAMI libraries of a provider")
+    ap.add_argument("export")
+    ap.add_argument("metadata")
+    ap.add_argument("dir")
+    ap.add_argument("--device", default="cpu", choices=DEVICES + tuple(DEVICE_ALIASES))
+    ap.add_argument("--precision", default="f64", choices=PRECISIONS)
+    ap.add_argument("--interpreter", action="store_true", help="the UIR interpreter's data instead of straight-line C")
+    ap.add_argument("--imported", action="store_true", help="the programs as imported (not optimized)")
+    ap.add_argument("--quiet", action="store_true")
+    a = ap.parse_args(argv)
+    print(umami_libraries(a.export, a.metadata, a.dir, device=a.device, precision=a.precision, interpreter=a.interpreter,
+                          optimize_programs=not a.imported, quiet=a.quiet))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

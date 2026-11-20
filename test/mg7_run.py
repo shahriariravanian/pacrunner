@@ -3,7 +3,7 @@ changing MadGraph7: the AmplicolSubprocess class is replaced, in this process on
 loads the libraries of umami_libraries (one per program, flavour 0) and lets MadSpace split each
 batch by flavour (one DifferentialCrossSection per library of the UMAMI channel).
 
-  python mg7_run.py prepare OUTPUT [--device cpu|cuda] [--precision f64|mixed|...] [--julia JULIA]
+  python mg7_run.py prepare OUTPUT [--device cpu|cuda] [--precision f64|mixed|...] [--python PYTHON]
       the recurrence export of every SubProcesses/*/lc artifact and, per UMAMI provider, the
       libraries in OUTPUT/lib/pacrunner[-cuda]/<name>_<provider>/umami_pac.json
   python mg7_run.py run OUTPUT [--device cpu|cuda|cuda_provider|<device>-<precision>] [generate_events arguments, default -f]
@@ -25,7 +25,9 @@ import re
 import subprocess
 import sys
 
-PAC_JULIA = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+PACRUNNER = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# the python that builds the libraries (pacrunner and symjit >= 2.29): PACRUNNER_PYTHON, else this one
+PYTHON = os.environ.get("PACRUNNER_PYTHON", sys.executable)
 
 
 def mg5_dir(output):
@@ -64,18 +66,20 @@ def card_parameters(output, references):
     return parameters
 
 
-def julia_build(julia="julia"):
-    """umami_libraries in a julia process: (export, metadata, dir, device, precision) -> None"""
-    script = ("using PacRunner; umami_libraries(ARGS[1], ARGS[2], ARGS[3]; device = Symbol(ARGS[4]), "
-              "precision = Symbol(ARGS[5])); println(ARGS[3])")
-    return lambda *args: subprocess.check_call([julia, f"--project={PAC_JULIA}", "-e", script, *args])
+def python_build(python=PYTHON):
+    """umami_libraries in a python process (python -m pacrunner.umami, this repository first on its
+    path): (export, metadata, dir, device, precision) -> None"""
+    env = dict(os.environ, PYTHONPATH=os.pathsep.join(p for p in (PACRUNNER, os.environ.get("PYTHONPATH")) if p))
+    return lambda export, metadata, dir_, device, precision: subprocess.check_call(
+        [python, "-m", "pacrunner.umami", export, metadata, dir_, "--device", device, "--precision", precision, "--quiet"],
+        env=env)
 
 
-def prepare(output, device="cpu", julia="julia", precision="f64", build=None):
+def prepare(output, device="cpu", python=PYTHON, precision="f64", build=None):
     """The recurrence export and the PacRunner libraries of every [amplicol] provider of `output`;
-    `build(export, metadata, dir, device, precision)` runs umami_libraries (default: a julia
-    process, julia_build). Returns the libraries' folders."""
-    build = build or julia_build(julia)
+    `build(export, metadata, dir, device, precision)` runs umami_libraries (default: a python
+    process, python_build). Returns the libraries' folders."""
+    build = build or python_build(python)
     folders = []
     output = os.path.abspath(output)
     entries = json.load(open(os.path.join(output, "SubProcesses", "subprocesses.json")))
@@ -115,9 +119,9 @@ def timed(path, name):
     if not log:
         return path
     shim = os.path.join(os.path.dirname(path), "libumami_timer.so")
-    subprocess.check_call(["cc", "-O2", "-std=c11", "-fPIC", "-shared", f"-I{os.path.join(PAC_JULIA, 'c')}",
+    subprocess.check_call(["cc", "-O2", "-std=c11", "-fPIC", "-shared", f"-I{os.path.join(PACRUNNER, 'c')}",
                            f'-DREAL_LIB="{os.path.abspath(path)}"', f'-DLOG_FILE="{os.path.abspath(log)}"',
-                           f'-DNAME="{name}"', os.path.join(PAC_JULIA, "test", "umami_timer.c"), "-o", shim, "-ldl"])
+                           f'-DNAME="{name}"', os.path.join(PACRUNNER, "test", "umami_timer.c"), "-o", shim, "-ldl"])
     return shim
 
 
@@ -231,7 +235,7 @@ if __name__ == "__main__":
     command, output, *rest = sys.argv[1:]
     if command == "prepare":
         opts = dict(zip(rest[::2], rest[1::2]))
-        prepare(output, opts.get("--device", "cpu"), opts.get("--julia", "julia"), opts.get("--precision", "f64"))
+        prepare(output, opts.get("--device", "cpu"), opts.get("--python", PYTHON), opts.get("--precision", "f64"))
     elif command == "run":
         device = "cpu"
         if rest[:1] == ["--device"]:

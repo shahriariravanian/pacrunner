@@ -1,79 +1,43 @@
-"""pacrunner's low-level API: PacRunner.jl's exported functions and types, from Python, through juliacall.
+"""pacrunner's low-level API: the recurrence export, UIR, the kernels, the C and the UMAMI libraries, in
+Python (until 0.3 PacRunner.jl's exports through juliacall; the names are kept where the function is).
 
     from pacrunner import lowlevel as pr
-    programs = pr.load_recurrence_export("export.json")        # a Julia Vector{Lowered}
+    programs = pr.load_recurrence_export("export.json")        # one Lowered per program entry
     pr.umami_libraries("export.json", "metadata.json", "out", device="cuda", precision="mixed")
-    pr.compile("folder", programs[0], interpreter=True)
-    pr.jl                                                      # the PacRunner module itself
+    pr.compile("folder", pr.optimize(programs[0]), interpreter=True)
 
-Every name PacRunner.jl exports (but the deprecated v1 path: main.json, pac2json) is a function of
-the same name here, documented by its Julia docstring (`help(pr.umami_libraries)` after Julia started;
-`pr.doc(name)`). The wrappers only convert what Python cannot spell: the keywords Julia types as a
-Symbol (device, precision, kernels) take strings, and paths take any os.PathLike. Results are
-juliacall objects (Julia's own: index them, pass them back, convert with juliacall's tools).
-
-Julia starts at the first call (pacrunner._julia: this repository's Julia project, PacRunner loaded).
+The modules are pacrunner.uir (UIR v0.8: the export reader, validate, the passes, the encoding),
+pacrunner.kernels (the symjit kernels' MIR and C), pacrunner.codegen (compile) and pacrunner.umami.
+Indices are 0-based (None: absent). Gone with Julia: LArena and evaluate (the Julia runner: the C is
+the runner), reuse_planes (a no-op for every imported program), read_sjb, SavedApplication, MIR and
+complexify (symjit's MIR JSON: kernels.read_mir).
 """
 
-import os
+from .codegen import ArenaIndex, Examples, compile
+from .kernels import kernel_c, kernel_c_mixed, listing, read_mir
+from .umami import umami_libraries
+from .uir import (Encoded, Lowered, decode, encode, fuse, load_recurrence_export, optimize, recurrence_references, sort_runs,
+                  validate)
 
-from . import _julia
-
-# PacRunner.jl's exports (src/PacRunner.jl), but v1's (deprecated: Program, Arena, read_main, load_artifact,
-# load_programs, load_examples, lower, install, capture, alpha_s_power); test_lowlevel checks the list
+# the names of the low-level API (test_lowlevel checks them)
 EXPORTS = (
     # RustiCol's recurrence export
     "load_recurrence_export", "recurrence_references", "umami_libraries",
     # UIR
-    "Lowered", "LArena", "evaluate", "validate", "sort_runs", "fuse", "reuse_planes", "optimize", "Encoded", "encode",
-    "decode",
+    "Lowered", "validate", "sort_runs", "fuse", "optimize", "Encoded", "encode", "decode",
     # the C
-    "compile", "ArenaIndex",
+    "compile", "ArenaIndex", "Examples",
     # the kernels
-    "read_sjb", "SavedApplication", "MIR", "complexify", "listing", "kernel_c",
+    "read_mir", "listing", "kernel_c", "kernel_c_mixed",
 )
-V1 = ("Program", "Arena", "read_main", "load_artifact", "load_programs", "load_examples", "lower", "install",
-      "capture", "alpha_s_power")
-
-# the keywords of the exported functions that Julia types as a Symbol
-SYMBOL_KEYWORDS = frozenset({"device", "precision", "kernels"})
-
-
-def _arg(x):
-    return os.fspath(x) if isinstance(x, os.PathLike) else x
-
-
-def _wrap(name):
-    def call(*args, **kwargs):
-        jl = _julia.main()
-        f = getattr(_julia.pacrunner(), name)
-        args = [_arg(a) for a in args]
-        kwargs = {k: jl.Symbol(v) if k in SYMBOL_KEYWORDS and isinstance(v, str) else _arg(v)
-                  for k, v in kwargs.items()}
-        return f(*args, **kwargs)
-
-    call.__name__ = call.__qualname__ = name
-    call.__doc__ = f"PacRunner.{name} (Julia; its docstring: pacrunner.lowlevel.doc({name!r}))."
-    return call
-
-
-for _name in EXPORTS:
-    globals()[_name] = _wrap(_name)
+# PacRunner.jl's exports that have no Python counterpart
+GONE = ("LArena", "evaluate", "reuse_planes", "read_sjb", "SavedApplication", "MIR", "complexify", "jl", "doc")
 
 
 def __getattr__(name):
-    if name == "jl":
-        return _julia.pacrunner()
-    if name in V1:
-        raise AttributeError(f"PacRunner.{name} is the deprecated v1 path (main.json, pac2json): not in pacrunner; "
-                             f"pacrunner.lowlevel.jl.{name} reaches it")
+    if name in GONE:
+        raise AttributeError(f"pacrunner.lowlevel.{name} was PacRunner.jl's (Julia), not ported: see the module's docstring")
     raise AttributeError(f"module 'pacrunner.lowlevel' has no attribute {name!r}")
 
 
-def doc(name):
-    """the Julia docstring of an exported name, as text"""
-    jl = _julia.main()
-    return str(jl.seval(f"string(@doc PacRunner.{name})"))
-
-
-__all__ = list(EXPORTS) + ["doc", "jl", "EXPORTS", "SYMBOL_KEYWORDS"]
+__all__ = list(EXPORTS) + ["EXPORTS"]

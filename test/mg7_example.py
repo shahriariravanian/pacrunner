@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""An end-to-end example of PacRunner (pac-julia) in MadGraph7: from a process to its cross section.
+"""An end-to-end example of PacRunner (pacrunner) in MadGraph7: from a process to its cross section.
 
   1. MadGraph7 generates the process with pyAmpliCol ([amplicol]) and writes an mg7 output;
   2. pyAmpliCol exports the output's recurrence programs (`pyamplicol export-recurrence`), and
-     PacRunner, called from Python through juliacall, builds one UMAMI library per program
-     (PacRunner.umami_libraries);
+     pacrunner builds one UMAMI library per program (pacrunner.umami.umami_libraries, run as
+     `python -m pacrunner.umami` in PACRUNNER_PYTHON, by default this python);
   3. MadSpace integrates and generates events on those libraries (test/mg7_run.py swaps them in for
      the stock pyAmpliCol library of the run);
   4. optionally (--stock) the same run on the stock library, for comparison.
@@ -17,8 +17,8 @@ usage:
 Needs:
   - MadGraph7 with pyAmpliCol's recurrence export (MadGraphTeam/MadGraph7 PR #452 or later), with
     MadSpace and pyAmpliCol installed in it (`install madspace`, `install pyamplicol`);
-  - Julia (1.10 or later) and this repository; `pip install juliacall` in the python that runs
-    MadGraph7 (the first run lets juliacall set up its Julia environment);
+  - this repository and symjit >= 2.29 (conda install -c conda-forge 'symjit>=2.29') in the python
+    that builds the libraries: PACRUNNER_PYTHON, or the python that runs MadGraph7;
   - a C compiler; for --device cuda / cuda_provider the CUDA toolkit (nvcc on the PATH or in
     /usr/local/cuda/bin), and for cuda_provider a CUDA build of MadSpace in
     MADGRAPH7/madspace/install-cuda (cmake -DENABLE_CUDA=ON).
@@ -41,13 +41,11 @@ import glob
 import json
 import os
 import re
-import shutil
 import subprocess
 import sys
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-PAC_JULIA = os.path.dirname(HERE)
 sys.path.insert(0, HERE)
 import mg7_run  # noqa: E402  (test/mg7_run.py: the export, and the run on PacRunner's libraries)
 
@@ -82,31 +80,17 @@ def edit_card(output, settings, sections=None):
     open(path, "w").write(card)
 
 
-def pacrunner():
-    """PacRunner in this process, through juliacall (with the Julia on the PATH, if any)."""
-    os.environ.setdefault("PYTHON_JULIACALL_HANDLE_SIGNALS", "yes")
-    julia = shutil.which("julia")
-    if julia:
-        os.environ.setdefault("PYTHON_JULIAPKG_EXE", julia)
-    from juliacall import Main as jl
-    jl.seval("import Pkg")
-    jl.Pkg.activate(PAC_JULIA)     # this repository's project
-    jl.Pkg.instantiate()
-    jl.seval("using PacRunner")
-    return jl
+def build_libraries(output, device, precision, python=None):
+    """Step 2: the recurrence export of each [amplicol] provider and its PacRunner libraries, built by
+    `python -m pacrunner.umami` in `python` (default: PACRUNNER_PYTHON, else this python)."""
+    build = mg7_run.python_build(python or mg7_run.PYTHON)
 
-
-def build_libraries(output, device, precision):
-    """Step 2: the recurrence export of each [amplicol] provider and its PacRunner libraries."""
-    jl = pacrunner()
-
-    def build(export, metadata, folder, device_, precision_):
-        table = jl.PacRunner.umami_libraries(export, metadata, folder, device=jl.Symbol(device_),
-                                             precision=jl.Symbol(precision_), quiet=True)
-        count = len(json.load(open(str(table)))["libraries"])
+    def counted(export, metadata, folder, device_, precision_):
+        build(export, metadata, folder, device_, precision_)
+        count = len(json.load(open(os.path.join(folder, "umami_pac.json")))["libraries"])
         print(f"  {count} libraries in {folder}", flush=True)
 
-    return mg7_run.prepare(output, device, precision=precision, build=build)
+    return mg7_run.prepare(output, device, precision=precision, build=counted)
 
 
 def result(output):

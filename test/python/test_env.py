@@ -1,4 +1,4 @@
-"""pacrunner._env: discovery and configuration, without Julia or MadSpace.
+"""pacrunner._env: discovery and configuration, without MadSpace.
 
     python -m unittest discover -s test/python      (or pytest test/python)
 
@@ -17,26 +17,18 @@ from pacrunner import _env
 
 
 class Repository(unittest.TestCase):
-    def test_repository_is_the_julia_project(self):
+    def test_repository_has_the_c_sources(self):
         root = pacrunner.repository()
-        self.assertTrue((root / "Project.toml").is_file())
-        self.assertTrue((root / "src" / "PacRunner.jl").is_file())
+        self.assertTrue((root / "c" / "umami_pac.c").is_file())
+        self.assertTrue((root / "c" / "pacops.c").is_file())
         self.assertEqual(root, Path(pacrunner.__file__).resolve().parent.parent)
 
 
-class Julia(unittest.TestCase):
-    def test_julia_from_the_environment(self):
-        with mock.patch.dict(os.environ, {"PACRUNNER_JULIA": sys.executable}), \
-                mock.patch.object(_env.CONFIG, "julia", None):
-            self.assertEqual(_env.julia(), sys.executable)
-
-    def test_no_julia_is_a_clear_error(self):
-        env = {k: v for k, v in os.environ.items() if k != "PACRUNNER_JULIA"}
-        env["PATH"] = tempfile.mkdtemp()
-        with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(_env.CONFIG, "julia", None):
-            with self.assertRaises(pacrunner.PacRunnerError) as e:
-                _env.julia()
-            self.assertIn("install it", str(e.exception))
+class NoJulia(unittest.TestCase):
+    def test_configure_julia_is_ignored_with_a_warning(self):
+        with self.assertWarns(DeprecationWarning):
+            pacrunner.configure(julia="julia")
+        self.assertFalse(hasattr(_env.CONFIG, "julia"))
 
 
 class MadGraph7(unittest.TestCase):

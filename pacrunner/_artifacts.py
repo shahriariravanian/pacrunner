@@ -30,11 +30,11 @@ def _read(path):
 
 
 def _git_revision(folder):
-    """this repository's revision, '+' when its Julia or C sources differ from it (None without git)"""
+    """this repository's revision, '+' when its Python or C sources differ from it (None without git)"""
     try:
         head = subprocess.run(["git", "-C", os.fspath(folder), "rev-parse", "HEAD"], capture_output=True, text=True,
                               check=True).stdout.strip()
-        dirty = subprocess.run(["git", "-C", os.fspath(folder), "status", "--porcelain", "--", "src", "c"],
+        dirty = subprocess.run(["git", "-C", os.fspath(folder), "status", "--porcelain", "--", "pacrunner", "c"],
                                capture_output=True, text=True, check=True).stdout.strip()
         return head + ("+" if dirty else "")
     except (OSError, subprocess.CalledProcessError):
@@ -210,26 +210,26 @@ class Artifact:
 
     def compile(self, folder=None, device="cpu", precision="f64", parameters=None, interpreter=False, force=False):
         """PacRunner's UMAMI libraries of this provider: the export (export()), then umami_libraries
-        (Julia) into `folder` (default: default_folder()); returns the Provider. Skipped when `folder`
-        holds libraries of the same artifact, provider, parameters, device, precision and pac-julia
-        revision (its pacrunner-build.json), unless `force`. device: "cpu", "cuda" (the GPU, a CPU
+        (pacrunner.umami) into `folder` (default: default_folder()); returns the Provider. Skipped when
+        `folder` holds libraries of the same artifact, provider, parameters, device, precision and
+        pacrunner revision (its pacrunner-build.json), unless `force`. device: "cpu", "cuda" (the GPU, a CPU
         provider), "cuda_provider" or its alias "cuda_full" (MadSpace's GPU runtime); precision "f64" or
         "mixed" (the GPU)."""
-        from . import lowlevel
+        from .umami import umami_libraries
         device = _env.device_name(device)
         from ._libraries import Provider
         folder = Path(folder) if folder is not None else self.default_folder(device, precision)
         stamp = {"artifact_id": self.id, "provider": self.provider, "device": device, "precision": precision,
                  "interpreter": bool(interpreter), "parameters": dict(sorted((parameters or {}).items())),
-                 "pac_julia": _git_revision(_env.repository())}
+                 "pacrunner": _git_revision(_env.repository())}
         if not force and (folder / "umami_pac.json").is_file() and (folder / STAMP).is_file():
-            if _read(folder / STAMP) == stamp and stamp["pac_julia"] is not None and not stamp["pac_julia"].endswith("+"):
+            if _read(folder / STAMP) == stamp and stamp["pacrunner"] is not None and not stamp["pacrunner"].endswith("+"):
                 return Provider(folder)
         folder.mkdir(parents=True, exist_ok=True)
         (folder / STAMP).unlink(missing_ok=True)
         export = self.export(folder / "export.json", parameters)
-        lowlevel.umami_libraries(export, self.metadata_path, folder, device=device, precision=precision,
-                                 interpreter=interpreter, quiet=True)
+        umami_libraries(export, self.metadata_path, folder, device=device, precision=precision, interpreter=interpreter,
+                        quiet=True)
         (folder / STAMP).write_text(json.dumps(stamp, indent=1))
         return Provider(folder)
 

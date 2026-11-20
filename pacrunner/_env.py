@@ -1,9 +1,8 @@
-"""Where pacrunner's tools are: this repository (the Julia project), Julia, a MadGraph7 checkout with
-its MadSpace (CPU or CUDA build) and pyAmpliCol. Set with pacrunner.configure(...), else from the
-environment (PACRUNNER_JULIA, PACRUNNER_MADGRAPH7), else found."""
+"""Where pacrunner's tools are: this repository (its C sources, c/), a MadGraph7 checkout with its
+MadSpace (CPU or CUDA build) and pyAmpliCol. Set with pacrunner.configure(...), else from the
+environment (PACRUNNER_MADGRAPH7, PACRUNNER_PYAMPLICOL), else found."""
 
 import os
-import shutil
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -13,7 +12,7 @@ class PacRunnerError(RuntimeError):
     """A pacrunner setup or use error, with what to do about it"""
 
 
-# the repository: the Julia project (Project.toml, src/PacRunner.jl) is this package's parent folder
+# the repository: this package's parent folder, with the C sources the libraries are built from (c/)
 # (pacrunner is installed editable, from a clone)
 REPOSITORY = Path(__file__).resolve().parent.parent
 
@@ -27,15 +26,14 @@ def device_name(device: str) -> str:
 
 
 def repository() -> Path:
-    if not (REPOSITORY / "Project.toml").is_file() or not (REPOSITORY / "src" / "PacRunner.jl").is_file():
-        raise PacRunnerError(f"{REPOSITORY}: not the pac-julia repository (no Project.toml, src/PacRunner.jl): "
+    if not (REPOSITORY / "c" / "umami_pac.c").is_file() or not (REPOSITORY / "c" / "pacops.c").is_file():
+        raise PacRunnerError(f"{REPOSITORY}: not the pacrunner repository (no c/umami_pac.c, c/pacops.c): "
                              "install pacrunner from a clone, `python -m pip install -e .` in it")
     return REPOSITORY
 
 
 @dataclass
 class Config:
-    julia: str | None = None            # the julia executable
     madgraph7: str | None = None        # a MadGraph7 checkout (madspace/, pyamplicol/)
     cuda: bool | None = None            # MadSpace's CUDA build (None: when MadGraph7 has one)
     pyamplicol: str | None = None       # a pyAmpliCol installation: a python or an install folder
@@ -45,18 +43,17 @@ CONFIG = Config()
 
 
 def configure(julia=None, madgraph7=None, cuda=None, pyamplicol=None):
-    """Where pacrunner's tools are, for this process: `julia` (the executable; default PACRUNNER_JULIA,
-    else `julia` on the PATH), `madgraph7` (a MadGraph7 checkout with MadSpace and pyAmpliCol installed;
-    default PACRUNNER_MADGRAPH7, or an mg7 output's own), `cuda` (True: MadSpace's CUDA build, False: the
-    CPU build; default: the CUDA build when MadGraph7 has one), `pyamplicol` (a pyAmpliCol installation
-    for artifacts it produced: a python that imports pyamplicol, or an install folder such as
-    MADGRAPH7/pyamplicol/install; default PACRUNNER_PYAMPLICOL, else found). Julia and MadSpace are loaded
-    once per process: configure them before their first use. Returns the configuration."""
-    from . import _julia
+    """Where pacrunner's tools are, for this process: `madgraph7` (a MadGraph7 checkout with MadSpace and
+    pyAmpliCol installed; default PACRUNNER_MADGRAPH7, or an mg7 output's own), `cuda` (True: MadSpace's
+    CUDA build, False: the CPU build; default: the CUDA build when MadGraph7 has one), `pyamplicol` (a
+    pyAmpliCol installation for artifacts it produced: a python that imports pyamplicol, or an install
+    folder such as MADGRAPH7/pyamplicol/install; default PACRUNNER_PYAMPLICOL, else found). MadSpace is
+    loaded once per process: configure it before its first use. `julia` is ignored (with a warning):
+    pacrunner no longer uses Julia. Returns the configuration."""
     if julia is not None:
-        if _julia.booted():
-            raise PacRunnerError("Julia is already running in this process: configure(julia=...) before the first use")
-        CONFIG.julia = os.fspath(julia)
+        import warnings
+        warnings.warn("pacrunner.configure(julia=...) is ignored: pacrunner no longer uses Julia", DeprecationWarning,
+                      stacklevel=2)
     if madgraph7 is not None or cuda is not None:
         if "madspace" in sys.modules:
             raise PacRunnerError("MadSpace is already loaded in this process: configure(madgraph7=..., cuda=...) "
@@ -68,15 +65,6 @@ def configure(julia=None, madgraph7=None, cuda=None, pyamplicol=None):
     if pyamplicol is not None:
         CONFIG.pyamplicol = os.fspath(Path(pyamplicol).expanduser())
     return CONFIG
-
-
-def julia() -> str:
-    """the julia executable: configure(julia=...), PACRUNNER_JULIA, or `julia` on the PATH"""
-    exe = CONFIG.julia or os.environ.get("PACRUNNER_JULIA") or shutil.which("julia")
-    if not exe or not (shutil.which(exe) or os.path.isfile(exe)):
-        raise PacRunnerError("no Julia: install it (https://julialang.org/downloads/, e.g. juliaup) and put `julia` "
-                             "on the PATH, or set PACRUNNER_JULIA, or pacrunner.configure(julia=...)")
-    return shutil.which(exe) or exe
 
 
 def madgraph7(required=True) -> Path | None:

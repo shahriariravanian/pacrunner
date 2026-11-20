@@ -1,4 +1,4 @@
-"""pacrunner: pac-julia (PacRunner.jl) from Python.
+"""pacrunner: PacRunner (formerly pac-julia) in Python.
 
 pyAmpliCol's leading-colour recurrence programs, compiled by PacRunner into UMAMI libraries (CPU, CUDA)
 for MadGraph7 and MadSpace. Two layers:
@@ -8,10 +8,12 @@ for MadGraph7 and MadSpace. Two layers:
     Artifact/SubProcess.stock(), or PacRunner's build, .compile(); in an output, Provider.run:
     generate_events on it) and Runtime, the one callable for any UMAMI matrix element (one channel of
     a provider);
-  - the low-level API, pacrunner.lowlevel: PacRunner.jl's exported functions through juliacall.
+  - the low-level API, pacrunner.lowlevel: the recurrence export, UIR, the kernels' C, the generated C
+    and the UMAMI libraries (the modules uir, kernels, codegen, umami).
 
-Setup: Julia installed (`julia` on the PATH, or PACRUNNER_JULIA), this repository cloned and installed
-with `python -m pip install -e .`, a MadGraph7 checkout with MadSpace for running libraries:
+Setup: this repository cloned and installed with `python -m pip install -e .`, symjit >= 2.29 (conda
+install -c conda-forge 'symjit>=2.29': the kernels' MIR), a C compiler (nvcc for the GPU), a MadGraph7
+checkout with MadSpace for running libraries:
 
     import pacrunner
     pacrunner.configure(madgraph7="~/MadGraph7")      # or PACRUNNER_MADGRAPH7
@@ -32,10 +34,10 @@ from ._env import CONFIG, Config, PacRunnerError, configure, repository
 __version__ = "0.2.0"
 
 # imported on first use: `python -m pacrunner._madgraph` runs in MadGraph7's python, which may have
-# no numpy; the low-level layer starts nothing until one of its functions is called
+# no numpy (nor symjit: only building libraries needs it)
 _LAZY = {"Output": "._mad", "SubProcess": "._mad", "Artifact": "._artifacts", "Provider": "._libraries",
          "Runtime": "._runtime", "RuntimeResult": "._runtime", "RunResult": "._mgrun", "load_libraries": "._libraries",
-         "lowlevel": None,
+         "lowlevel": None, "uir": None, "kernels": None, "codegen": None, "umami": None,
          # the 0.1 names (one release)
          "MadOutput": "._mad", "MadArtifact": "._mad", "PacArtifact": "._artifacts", "PacLibrary": "._libraries",
          "MadLibrary": "._libraries"}
@@ -51,5 +53,6 @@ def __getattr__(name):
     raise AttributeError(f"module 'pacrunner' has no attribute {name!r}")
 
 
-__all__ = ["CONFIG", "Config", "PacRunnerError", "configure", "repository", "lowlevel", "Output", "SubProcess", "Artifact",
-           "Provider", "Runtime", "RuntimeResult", "RunResult", "load_libraries", "__version__"]
+__all__ = ["CONFIG", "Config", "PacRunnerError", "configure", "repository", "lowlevel", "uir", "kernels", "codegen", "umami",
+           "Output", "SubProcess", "Artifact", "Provider", "Runtime", "RuntimeResult", "RunResult", "load_libraries",
+           "__version__"]

@@ -1,6 +1,6 @@
 """An end-to-end MadGraph7 run (event generation, the cross section) on PacRunner's UMAMI libraries.
 
-Given a pac-julia folder (the output of PacRunner's umami_libraries) and the pyAmpliCol artifact it
+Given a PacRunner folder (the output of PacRunner's umami_libraries) and the pyAmpliCol artifact it
 was built from, `run` starts MadGraph7's generate_events on the mg7 output that holds the artifact,
 with that subprocess's stock pyAmpliCol library replaced by the PacRunner libraries: one MadSpace
 matrix element per library, MadSpace splitting each batch by flavour (every library sees flavour 0).
@@ -64,7 +64,7 @@ def mg7_output(artifact):
 
 
 def read_table(libraries):
-    """umami_pac.json of a pac-julia folder (or the file itself), with its folder"""
+    """umami_pac.json of a PacRunner folder (or the file itself), with its folder"""
     path = libraries if libraries.endswith(".json") else os.path.join(libraries, "umami_pac.json")
     with open(path) as f:
         table = json.load(f)
@@ -79,7 +79,7 @@ def provider_id(metadata_path):
 
 
 class Pair:
-    """one pac-julia folder and its artifact: the table, the provider, the device"""
+    """one PacRunner folder and its artifact: the table, the provider, the device"""
 
     def __init__(self, libraries, artifact):
         self.table, self.dir = read_table(libraries)
@@ -239,7 +239,7 @@ def latest_run(output):
 
 
 def run(libraries, artifact=None, args=None):
-    """An end-to-end MadGraph7 run on PacRunner's libraries: `libraries` a pac-julia folder and
+    """An end-to-end MadGraph7 run on PacRunner's libraries: `libraries` a PacRunner folder and
     `artifact` its pyAmpliCol artifact (inside an mg7 output), or a list of such pairs; `args`
     generate_events' arguments (default ["-f"]). Returns {"cross_section", "error" (pb), "events",
     "run" (the run's folder in OUTPUT/Events), "output"}."""
