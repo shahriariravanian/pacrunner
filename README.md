@@ -13,7 +13,8 @@ generators and [MadGraph](https://github.com/MadGraphTeam/MadGraph7) ecosystem.
 3. Install [pyAmpliCol](https://github.com/MadGraphTeam/pyamplicol). It should be on the path.
 4. Install symjit 2.29 or later from conda-forge: `conda install -c conda-forge 'symjit>=2.29'`.
    symjit is distributed through conda because of its binary dependencies, so it is not a pip
-   requirement of PacRunner. PacRunner uses it to read the symjit kernels of a program.
+   requirement of PacRunner. PacRunner uses it to read the symjit kernels of a program, and checks
+   its version (that of symjit's native library) before it builds anything.
 5. Clone PacRunner: `git clone https://github.com/shahriariravanian/pacrunner`, then `cd pacrunner`.
 6. Install it, editable: `python -m pip install -e .` (the package finds its C sources, `c/`, beside it).
 7. Optional tests: `python -m unittest discover -s test/python` (see [Tests](#tests)).

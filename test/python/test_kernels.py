@@ -18,6 +18,7 @@ import struct
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 from goldens import FIXTURE_EXPORTS, ROOT, golden_sets
@@ -25,11 +26,9 @@ from goldens import FIXTURE_EXPORTS, ROOT, golden_sets
 from pacrunner import kernels, uir
 from pacrunner._literal import julia_repr
 
-try:
+HAVE_MIR_JSON = kernels.symjit_problem() is None   # symjit >= 2.29 (its native library's version)
+if HAVE_MIR_JSON:
     import symjit
-    HAVE_MIR_JSON = hasattr(symjit, "mir_json")
-except ImportError:
-    HAVE_MIR_JSON = False
 CC = shutil.which("cc")
 
 
@@ -191,6 +190,38 @@ class HandMade(unittest.TestCase):
             kernels.parse_mir(_mir_json([{"Frobnicate": {}}]))
         with self.assertRaises(kernels.MirError):
             kernels.parse_mir(_mir_json([{"Mov": {"dst": {"Gen": 0}}}]))
+
+
+
+class SymjitVersion(unittest.TestCase):
+    """require_symjit: symjit >= 2.29, by its native library's version"""
+
+    def problem(self, version):
+        with mock.patch("pacrunner.kernels.mir.symjit_version", return_value=version):
+            return kernels.symjit_problem()
+
+    def test_versions(self):
+        self.assertIn("not installed", self.problem(None))
+        for old in ("2.28.3", "2.9.0", "1.3.3", "symjit 1.3.3", "nonsense"):
+            self.assertIn("too old", self.problem(old), old)
+        if HAVE_MIR_JSON:   # the installed symjit has mir_json
+            for ok in ("2.29.0", "2.29.1", "2.30", "3.0.0"):
+                self.assertIsNone(self.problem(ok), ok)
+
+    def test_require_raises(self):
+        with mock.patch("pacrunner.kernels.mir.symjit_version", return_value="2.28.3"):
+            with self.assertRaises(kernels.MirError) as e:
+                kernels.require_symjit()
+            self.assertIn("symjit>=2.29", str(e.exception))
+
+    @unittest.skipUnless(HAVE_MIR_JSON, "no symjit >= 2.29")
+    def test_the_installed_symjit(self):
+        self.assertEqual(kernels.require_symjit(), kernels.symjit_version())
+
+    def test_the_mir_json_before_the_application_format(self):
+        with self.assertRaises(kernels.MirError) as e:
+            kernels.parse_mir(json.dumps({"format": "symjit-mir", "format_version": 1, "symjit_version": "2.29.0"}))
+        self.assertIn("update symjit", str(e.exception))
 
 
 if __name__ == "__main__":

@@ -215,8 +215,9 @@ class Artifact:
         revision and symjit (its pacrunner-build.json), unless `force`. device: "cpu", "cuda" (the GPU, a CPU
         provider), "cuda_provider" or its alias "cuda_full" (MadSpace's GPU runtime); precision "f64" or
         "mixed" (the GPU)."""
-        from .kernels import symjit_fingerprint
+        from .kernels import require_symjit, symjit_fingerprint
         from .umami import umami_libraries
+        require_symjit()   # symjit >= 2.29, before the export
         device = _env.device_name(device)
         from ._libraries import Provider
         folder = Path(folder) if folder is not None else self.default_folder(device, precision)

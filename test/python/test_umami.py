@@ -21,13 +21,9 @@ from unittest import mock
 
 from goldens import bits, first_difference, golden_sets
 
-from pacrunner import codegen, uir, umami
+from pacrunner import codegen, kernels, uir, umami
 
-try:
-    import symjit
-    HAVE_MIR_JSON = hasattr(symjit, "mir_json")
-except ImportError:
-    HAVE_MIR_JSON = False
+HAVE_MIR_JSON = kernels.symjit_problem() is None   # symjit >= 2.29 (its native library's version)
 
 UMAMI_SETS = [(n, d, e, m) for (n, d, e, m) in golden_sets() if m.get("metadata") and Path(m["metadata"]).is_file()]
 
@@ -129,6 +125,11 @@ class Units(unittest.TestCase):
     def test_errors_before_any_work(self):
         with self.assertRaises(umami.UmamiError):   # fmad: before the export is read or nvcc runs
             umami.umami_libraries("/nonexistent", "/nonexistent", "/nonexistent", device="cuda", fmad=True)
+
+    def test_an_old_symjit_is_refused_first(self):
+        with mock.patch("pacrunner.kernels.mir.symjit_version", return_value="2.28.3"):
+            with self.assertRaises(kernels.MirError):   # before the export is read
+                umami.umami_libraries("/nonexistent", "/nonexistent", "/nonexistent")
 
     def test_cli_error_is_exit_1(self):
         with mock.patch("sys.stderr", new_callable=io.StringIO) as err:

@@ -11,6 +11,7 @@ locations are Reg and Loc, the constants doubles (the file has their bit pattern
 from __future__ import annotations
 
 import json
+import re
 import struct
 from dataclasses import dataclass, fields
 from typing import Optional, Union
@@ -279,6 +280,9 @@ def parse_mir(text: Union[str, bytes, dict]) -> Mir:
     """a Mir from symjit's application JSON (format "symjit-application" v1: the program in
     `program`, the MIR in `mir`)"""
     d = text if isinstance(text, dict) else json.loads(text)
+    if d.get("format") == "symjit-mir":
+        raise MirError(f"the MIR JSON of symjit {d.get('symjit_version', '?')} before the application format "
+                       f"(a 2.29 development build): update symjit ({SYMJIT_INSTALL})")
     if d.get("format") != FORMAT or d.get("format_version") != FORMAT_VERSION:
         raise MirError(f"format {d.get('format')} v{d.get('format_version')}, this reader takes {FORMAT} v{FORMAT_VERSION}")
     (prog, m) = (d["program"], d["mir"])
@@ -292,15 +296,54 @@ def parse_mir(text: Union[str, bytes, dict]) -> Mir:
                symjit_version=str(d["symjit_version"]))
 
 
+SYMJIT_REQUIRED = (2, 29, 0)
+SYMJIT_INSTALL = "conda install -c conda-forge 'symjit>=2.29'"
+
+
+def symjit_version() -> Optional[str]:
+    """the version of the imported symjit, as its native library says it (symjit's package metadata
+    need not be the library imported); None without symjit (or without its library)"""
+    try:
+        from symjit import engine
+        v = engine.lib.info()
+    except Exception:   # not installed, or its library does not load here
+        return None
+    return v.decode() if isinstance(v, bytes) else str(v)
+
+
+def _version_tuple(v: str) -> Optional[tuple]:
+    m = re.search(r"(\d+)\.(\d+)(?:\.(\d+))?", v)
+    return None if m is None else (int(m.group(1)), int(m.group(2)), int(m.group(3) or 0))
+
+
+def symjit_problem() -> Optional[str]:
+    """why the imported symjit will not do (not installed, older than 2.29, or without mir_json),
+    or None"""
+    v = symjit_version()
+    need = f"pacrunner needs symjit >= {'.'.join(map(str, SYMJIT_REQUIRED))}: {SYMJIT_INSTALL}"
+    if v is None:
+        return f"symjit is not installed, or its library does not load ({need})"
+    t = _version_tuple(v)
+    if t is None or t < SYMJIT_REQUIRED:
+        return f"symjit {v} is too old ({need})"
+    import symjit
+    if not hasattr(symjit, "mir_json"):
+        return f"symjit {v} has no mir_json, a development build before it ({need})"
+    return None
+
+
+def require_symjit() -> str:
+    """symjit's version, or the MirError saying why the imported symjit will not do (symjit_problem)"""
+    problem = symjit_problem()
+    if problem is not None:
+        raise MirError(problem)
+    return symjit_version()
+
+
 def read_mir(application: Union[bytes, "os.PathLike", str]) -> Mir:
     """the MIR of a saved symjit application (.sjb bytes, or a path), lowered to real operations"""
-    try:
-        import symjit
-    except ImportError as e:
-        raise MirError("symjit is not installed (pacrunner needs symjit >= 2.29: conda install -c conda-forge symjit)") from e
-    if not hasattr(symjit, "mir_json"):
-        raise MirError(f"symjit {getattr(symjit, '__version__', '?')} has no mir_json "
-                       "(pacrunner needs symjit >= 2.29: conda install -c conda-forge 'symjit>=2.29')")
+    require_symjit()
+    import symjit
     return parse_mir(symjit.mir_json(application, "json-complex"))
 
 

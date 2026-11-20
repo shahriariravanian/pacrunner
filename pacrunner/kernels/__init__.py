@@ -7,7 +7,9 @@ JSON (mir.py, symjit >= 2.29), the C from kernel_c.py (pac-julia's kernel_c.jl).
 """
 
 from .kernel_c import KERNEL_PRELUDE, KernelCError, check_kernel, const_c, kernel_c, kernel_c_mixed, label_c
-from .mir import Mir, MirError, listing, parse_mir, read_mir, symjit_fingerprint
+from .mir import (Mir, MirError, listing, parse_mir, read_mir, require_symjit, symjit_fingerprint, symjit_problem,
+                  symjit_version)
 
 __all__ = ["KERNEL_PRELUDE", "KernelCError", "check_kernel", "const_c", "kernel_c", "kernel_c_mixed", "label_c",
-           "Mir", "MirError", "listing", "parse_mir", "read_mir", "symjit_fingerprint"]
+           "Mir", "MirError", "listing", "parse_mir", "read_mir", "require_symjit", "symjit_fingerprint", "symjit_problem",
+           "symjit_version"]

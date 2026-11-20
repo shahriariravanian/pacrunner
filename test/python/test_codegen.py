@@ -16,13 +16,9 @@ from pathlib import Path
 
 from goldens import FIXTURE_EXPORTS, golden_sets
 
-from pacrunner import codegen, uir
+from pacrunner import codegen, kernels, uir
 
-try:
-    import symjit
-    HAVE_MIR_JSON = hasattr(symjit, "mir_json")
-except ImportError:
-    HAVE_MIR_JSON = False
+HAVE_MIR_JSON = kernels.symjit_problem() is None   # symjit >= 2.29 (its native library's version)
 HAVE_MAKE = bool(shutil.which("cc") and shutil.which("make"))
 
 VARIANTS = ("imported-straight", "imported-interpreter", "optimized-straight", "optimized-interpreter")

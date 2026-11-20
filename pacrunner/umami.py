@@ -40,7 +40,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Sequence, Union
 
-from . import codegen, uir
+from . import codegen, kernels, uir
 from ._literal import julia_repr
 from .codegen.common import C_DIR, cstring
 from .codegen.compile_vm import GPU_MEMORY_DEFAULT
@@ -404,6 +404,7 @@ def umami_libraries(export, metadata, dir, *, optimize_programs: bool = True, in
     fmad = precision == "mixed" if fmad is None else fmad
     if fmad and precision == "f64":
         raise UmamiError("fmad = True is not the CPU's bits: precision = mixed only")
+    kernels.require_symjit()   # symjit >= 2.29 (the kernels' MIR), before any work
     export_path = os.path.abspath(export) if isinstance(export, (str, os.PathLike)) else None   # or an export already read
     d = uir.read_export(export)
     meta = read_metadata(metadata, d)
@@ -460,8 +461,6 @@ def main(argv=None) -> int:
     python with pacrunner and symjit >= 2.29, for scripts that run in another one, such as MadGraph7's);
     prints umami_pac.json's path (an error: its message, exit status 1). --help lists the options"""
     import argparse
-
-    from . import kernels
     ap = argparse.ArgumentParser(prog="python -m pacrunner.umami", description="PacRunner's UMAMI libraries of a provider")
     ap.add_argument("export")
     ap.add_argument("metadata")
