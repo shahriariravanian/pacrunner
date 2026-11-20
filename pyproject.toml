@@ -18,5 +18,5 @@ dependencies = ["numpy"]   # and symjit >= 2.29, from conda-forge (binary depend
 cuda = ["cupy-cuda13x"]
 
 [tool.setuptools]
-# only the Python package: the repository root also holds the C (c/), tests, and until 0.4 the Julia sources (src/)
+# only the Python package: the repository root also holds the C (c/) and the tests
 packages = ["pacrunner", "pacrunner.uir", "pacrunner.kernels", "pacrunner.codegen"]

@@ -1,5 +1,5 @@
-"""PacRunner's CUDA provider libraries (umami_libraries(...; device = :cuda_provider)) inside
-MadSpace's GPU runtime, against the CPU libraries (device = :cpu) of the same export in MadSpace's
+"""PacRunner's CUDA provider libraries (umami_libraries(..., device="cuda_provider")) inside
+MadSpace's GPU runtime, against the CPU libraries (device="cpu") of the same export in MadSpace's
 CPU runtime: for every library, the same events (random on-shell momenta, random helicity
 numbers) go through a MatrixElement in a CUDA context and in a CPU context. Compared bit for bit
 (f64) or within --rtol (mixed):

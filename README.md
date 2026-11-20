@@ -1,4 +1,4 @@
-# PacRuuner
+# PacRunner
 
 PacRunner is a compiler to convert [pyAmpliCol](https://github.com/MadGraphTeam/pyamplicol)'s recurrence 
 mode processes to UMAMI-compatible libraries for both CPU and GPU.
@@ -9,14 +9,17 @@ generators and [MadGraph](https://github.com/MadGraphTeam/MadGraph7) ecosystem.
 ## Installation
 
 1. Install [MadGraph7](https://github.com/MadGraphTeam/MadGraph7/).
-2. Install `MadGrapg7/madspace`. It should be available from Python: `import madspace as ms`.
-3. Install [pyAmpliCol](https://github.com/MadGraphTeam/pyamplicol). It shoud be on the path.
-4. Install Julia using juliaup: `curl -fsSL https://install.julialang.org | sh`. 
-5. Clone PacRunner, aka `pac-julia`, as `git clone https://github.com/shahriariravanian/pac-julia`.
-6. `cd pac-julia`.
-7. Optional tests: `julia --project -e 'using Pkg; Pkg.test()'` (takes a few minutes).
-8. Install PacRunner's Python API: `python -m pip install .`.
-9. Set `export NVCC=path/to/nvcc` (optional, should be needed only if CUDA is installed in a non-standard location).
+2. Install `MadGraph7/madspace`. It should be available from Python: `import madspace as ms`.
+3. Install [pyAmpliCol](https://github.com/MadGraphTeam/pyamplicol). It should be on the path.
+4. Install symjit 2.29 or later from conda-forge: `conda install -c conda-forge 'symjit>=2.29'`.
+   symjit is distributed through conda because of its binary dependencies, so it is not a pip
+   requirement of PacRunner. PacRunner uses it to read the symjit kernels of a program.
+5. Clone PacRunner: `git clone https://github.com/shahriariravanian/pacrunner`, then `cd pacrunner`.
+6. Install it, editable: `python -m pip install -e .` (the package finds its C sources, `c/`, beside it).
+7. Optional tests: `python -m unittest discover -s test/python` (see [Tests](#tests)).
+8. Set `export NVCC=path/to/nvcc` (optional, should be needed only if CUDA is installed in a non-standard location).
+
+You also need a C compiler (`cc`, or `CC`), and `nvcc` for the GPU devices.
   
 ## Quick Start
 
@@ -35,8 +38,8 @@ compiled yet. You can compile it as `make -C artifacts/zgg/API/umami/`, but PacR
 on demand if not available. After this command is executed, the compiled UMAMI driver (`libumami.so` 
 or `libumami.dylib`) is placed in `artifacts/.pyamplicol-api-build/zgg/umami/`. 
 
-First, let's see how PacRunner's Python API work. The first example does not use the Julia backend
-and runs the stock matrix-element generator:
+First, let's see how PacRunner's Python API works. The first example does not use PacRunner's
+compiler and runs the stock matrix-element generator:
 
 ```python
 import pacrunner
@@ -78,7 +81,7 @@ We will discuss the files in the source folder below. For now, let's continue wi
 PacRunner currently supports two types of GPU backend: `compile(device="cuda")` and `compile(device="cuda_provider")`
 (also called `device="cuda_full"`: everything on the GPU). 
 
-The first one is a hybrid provider, where the UMAMI library identies itself as a "CPU" provider but actually runs CUDA 
+The first one is a hybrid provider, where the UMAMI library identifies itself as a "CPU" provider but actually runs CUDA 
 kernels. The second one is a full CUDA provider that identifies itself as "CUDA". First, the `cuda` option:
 
 ```python
@@ -208,7 +211,7 @@ capture.json`; the format is its `docs/reference/recurrence-export.md`).
 | `pacops.c`, `pacops.h` | the sources and instructions |
 | `Makefile` | `make` (`runner.o`, `pacops.o`, `testing`), `make clean`; `CC`, `CFLAGS` may be set |
 
-With `interpreter = true`, `runner.c` holds the program as data (the encoded words, sources first, the
+With `interpreter=True`, `runner.c` holds the program as data (the encoded words, sources first, the
 edge table and the tables they index, as one `uir_program`) and includes `uirvm.c`, the UIR
 interpreter, copied next to it with `uirvm.h`. `run()`, `runner.h` and the values are the same, bit
 for bit. The straight-line C is the CPU runner (about twice as fast); the interpreter is the GPU's,
@@ -222,23 +225,55 @@ one thread each, momenta and outputs point by point on the host. Every function 
 and the kernels is then a device function too (`PAC_FN`), and the tables are `__device__` data
 (`UIR_DATA`). The outputs are the CPU build's bit for bit (`--fmad=false`, as `-ffp-contract=off`).
 
+## Building libraries directly
+
+`Artifact.compile` and `SubProcess.compile` export the programs and build the libraries for you. To
+build from a recurrence export you already have, call `pacrunner.umami.umami_libraries`, or run it
+from the command line (e.g. from another Python, such as MadGraph7's):
+
+```sh
+python -m pacrunner.umami EXPORT.json ARTIFACT/API/umami/metadata.json OUT --device cpu
+python -m pacrunner.umami EXPORT.json METADATA OUT --device cuda_provider --precision mixed --cuda-arch sm_90
+```
+
+`OUT/umami_pac.json` then lists the libraries and each channel's flavours, for MadSpace;
+`python -m pacrunner.umami --help` lists the options. Beneath it are the modules `pacrunner.uir` (the
+export read into UIR programs, the passes, the 8-byte encoding), `pacrunner.kernels` (the symjit
+kernels' MIR and their C) and `pacrunner.codegen` (a program as a compiled folder):
+
+```python
+from pacrunner import codegen, uir
+
+programs = uir.load_recurrence_export("export.json")     # one uir.Lowered per program
+codegen.compile("folder", uir.optimize(programs[0]))      # runner.c, runner.h, pacops.c, Makefile
+```
+
+Indices are 0-based throughout, and an absent one is `None`.
+
 ## Tests
 
 ```sh
-julia --project -e 'using Pkg; Pkg.test()'
+python -m unittest discover -s test/python
 ```
 
-Without external tools this tests the loader, the `.sjb` reader, the Complexifier, the Julia runner
-against RustiCol's outputs, and, with a C compiler (`CC`, default `cc`), the compiled C: its kernels
-are C (`kernel_c`), so every program's folder builds and passes `make test`, and every program runs
-in Julia with kernel libraries built from that C. With symjit-utils' `sjb2obj`, the tests also build
-the kernels' native libraries: Julia and C against them bit for bit, and each kernel's C against its
-library. With nvcc and a GPU, the interpreter's GPU build against its CPU build. With
-`PACRUNNER_ARTIFACT` an LC artifact and pac2json installed, its capture:
+Without external tools this checks the export reader, the passes, the encoding, the kernels' C and the
+compiled folders against pac-julia's outputs (`test/data/goldens`, byte for byte), and, with a C
+compiler, that the fixture's compiled folders pass `make test` (RustiCol's reference values, bit for
+bit).
+The kernels' tests need symjit ≥ 2.29. The larger golden corpus (`tools/goldens`) is used when it is
+at `PACRUNNER_GOLDENS` (default `~/symjit-data/pacrunner-goldens`). More tests run when their tools are
+set:
 
-```sh
-SJB2OBJ=/path/to/sjb2obj PACRUNNER_ARTIFACT=/path/to/lc julia --project -e 'using Pkg; Pkg.test()'
-```
+| Variable | What it enables |
+| --- | --- |
+| `PACRUNNER_MADGRAPH7` | a MadGraph7 checkout with MadSpace: the runtime tests |
+| `PACRUNNER_TEST_ARTIFACT`, `PACRUNNER_PYAMPLICOL` | an LC artifact and the pyAmpliCol that made it: export and compile |
+| `PACRUNNER_TEST_MG7_OUTPUT`, `PACRUNNER_TEST_CUDA_OUTPUT`, `PACRUNNER_TEST_MG7_MULTI` | mg7 outputs: end-to-end runs against stock |
+| `PACRUNNER_TEST_TUTORIAL=1` | the tutorial's snippets (`tutorial/`), about 3 minutes |
+
+Symbolica (pyAmpliCol) needs a writable `XDG_RUNTIME_DIR`. The scripts in `test/` (`umami_check.py`,
+`umami_check_gpu.py`, `test_libraries.py`, `mg7_run.py`, ...) compare built libraries against
+pyAmpliCol's stock ones through MadSpace; each says how to run it.
 
 The C must be built with `-ffp-contract=off` (nvcc: `--fmad=false`): the values are bit for bit only
 without contracted multiply-adds.

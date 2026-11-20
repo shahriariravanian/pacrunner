@@ -12,7 +12,7 @@ Each is warmed up, then the best of REPEATS calls; µs per event over all channe
 is load_libraries' overhead (1.00: none).
 
 usage: python bench_libraries.py OUT [--threads T] [--events N] [--repeats R] [--no-stock]
-  T: the context's threads (CPU outputs; default 1); a :cuda_provider output runs on a CUDA context
+  T: the context's threads (CPU outputs; default 1); a "cuda_provider" output runs on a CUDA context
   (MadSpace's CUDA build on PYTHONPATH, CuPy for the device arrays)."""
 
 import argparse

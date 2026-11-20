@@ -16,7 +16,7 @@ usage: python test_libraries.py OUT [STOCK_LIB ARTIFACT_DIR] [EVENTS]
   STOCK_LIB:  the stock library (default: the mg7 output's lib/libamplicol_<name>.so beside
               OUT = <output>/lib/pacrunner[-<device>]/<name>); ARTIFACT_DIR: the artifact (default:
               the libraries')
-MadSpace on PYTHONPATH (e.g. MadGraph7/madspace/install). For :cuda_provider libraries (a CUDA
+MadSpace on PYTHONPATH (e.g. MadGraph7/madspace/install). For "cuda_provider" libraries (a CUDA
 context; the stock library still on the CPU): MadSpace's CUDA build (madspace/install-cuda) and
 CuPy, whose arrays carry the inputs to the GPU (a CUDA runtime takes device arrays)."""
 
@@ -31,7 +31,7 @@ import madspace as ms  # noqa: E402
 from pacrunner import load_libraries  # noqa: E402
 
 ME = ms.MatrixElement
-MIXED_RTOL = 1e-4   # test_umami.jl's
+MIXED_RTOL = 1e-4   # pac-julia's test_umami.jl's
 
 
 def momenta(masses, events, rng):

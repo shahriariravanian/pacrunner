@@ -5,7 +5,7 @@
 
 PACRUNNER_TEST_ARTIFACT: a stand-alone LC artifact with its API bundle (`pyamplicol generate ...
 --color-accuracy lc --emit-api-bundle`); PACRUNNER_PYAMPLICOL: the pyAmpliCol that generated it (a
-python, or an install folder). The compile test starts Julia and builds the libraries (~15 s). The
+python, or an install folder). The compile test builds the libraries (~15 s). The
 tests of the producer check and the provider choice need nothing."""
 
 import json
