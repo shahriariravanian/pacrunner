@@ -10,7 +10,7 @@ from .encode import EncodeError, Encoded, decode, decode_edge, decode_rows, deco
 from .export import ExportError, export_kernels, load_recurrence_export, read_export, recurrence_references
 from .passes import fuse, optimize, sort_runs
 from .types import (TYPE_COMPONENTS, UIR_VERSION, Form, InputKind, Kernel, KernelInput, LCurrent, LEdge, LOp, Lowered, LStub,
-                    Opcode, PhysicalType, is_kernel, is_propagator, is_vertex, no_destination, operand_edges, source_fields,
+                    Opcode, PhysicalType, describe, is_kernel, is_propagator, is_vertex, no_destination, operand_edges, source_fields,
                     source_op, source_template)
 from .validate import InvalidLowered, problems, validate
 
@@ -19,7 +19,7 @@ __all__ = [
     "ExportError", "export_kernels", "load_recurrence_export", "read_export", "recurrence_references",
     "fuse", "optimize", "sort_runs",
     "TYPE_COMPONENTS", "UIR_VERSION", "Form", "InputKind", "Kernel", "KernelInput", "LCurrent", "LEdge", "LOp", "Lowered",
-    "LStub", "Opcode", "PhysicalType", "is_kernel", "is_propagator", "is_vertex", "no_destination", "operand_edges",
+    "LStub", "Opcode", "PhysicalType", "describe", "is_kernel", "is_propagator", "is_vertex", "no_destination", "operand_edges",
     "source_fields", "source_op", "source_template",
     "InvalidLowered", "problems", "validate",
 ]

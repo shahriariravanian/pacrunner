@@ -294,9 +294,10 @@ def read_mir(application: Union[bytes, "os.PathLike", str]) -> Mir:
     try:
         import symjit
     except ImportError as e:
-        raise MirError("symjit is not installed (pacrunner needs symjit >= 2.29)") from e
+        raise MirError("symjit is not installed (pacrunner needs symjit >= 2.29: conda install -c conda-forge symjit)") from e
     if not hasattr(symjit, "mir_json"):
-        raise MirError(f"symjit {getattr(symjit, '__version__', '?')} has no mir_json (pacrunner needs symjit >= 2.29)")
+        raise MirError(f"symjit {getattr(symjit, '__version__', '?')} has no mir_json "
+                       "(pacrunner needs symjit >= 2.29: conda install -c conda-forge 'symjit>=2.29')")
     return parse_mir(symjit.mir_json(application, "json-complex"))
 
 

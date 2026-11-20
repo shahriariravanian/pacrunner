@@ -252,6 +252,56 @@ class Lowered:
                 f"{len(self.currents)} currents on {self.planes} planes, {len(self.edges)} edges)")
 
 
+def describe(l: Lowered, op: LOp) -> str:
+    """A row as text, for the C comments and dumps (pac-julia's describe, the same text): main.json's
+    names (c<i>, q<i>, s<i>, x<i>, a<i>, from 0), an edge as its current with the momentum it is read
+    with (c12@q3); a binding instance, list, embedding and weight counted from 1, as pac-julia writes
+    them."""
+    def edge(e):
+        if e is None:
+            return "-"
+        f = l.edge_form(e)
+        return f"c{l.edge_current(e)}" + ("" if f is None else f"@q{f}")
+
+    def x(v):
+        return -1 if v is None else v   # pac-julia's x$(0 - 1) for no factor
+
+    o = op.op
+    mode = "=" if op.set else "+="
+    if not is_vertex(o) or (op.first and op.last):
+        run = ""
+    elif op.first:
+        run = " [run starts]"
+    elif op.last:
+        run = " [run ends]"
+    else:
+        run = " [in run]"
+    if is_vertex(o) or is_kernel(o):
+        what = f"s{op.t}" if is_vertex(o) else f"binding instance {op.t + 1}"
+        return f"{o.name} {edge(op.d)} {mode} {edge(op.l)}, {edge(op.r)}; {what} x{x(op.x)}{run}"
+    if is_propagator(o):
+        return f"{o.name} {edge(op.d)}; x{x(op.x)}"
+    if o == Opcode.CLOSURE:
+        return f"CLOSURE a{op.d} += {edge(op.l)} . {edge(op.r)}; list {op.t + 1} x{x(op.x)}"
+    if o == Opcode.SCALE_ROW:
+        return f"SCALE {edge(op.d)}, {op.n} components; x{x(op.x)}"
+    if o == Opcode.SOURCE:
+        (family, anti, h, ch) = source_fields(op)
+        how = f"x{x(op.x)}" if op.l is None else f"embedding {op.l + 1}"
+        return (f"SOURCE {edge(op.d)} = {family.name}{' antiparticle' if anti else ''}, helicity {h}, chirality {ch}, "
+                f"mass s{op.t}; {how}")
+    if o == Opcode.CLEAR_AMPLITUDE:
+        return f"CLEAR_AMPLITUDE a{op.d}"
+    if o == Opcode.COPY:
+        return f"COPY {edge(op.d)} = {edge(op.l)}; x{x(op.x)}"
+    if o == Opcode.SCATTER:
+        return f"SCATTER {edge(op.d)} {mode} {edge(op.l)}; x{x(op.x)}"
+    if o == Opcode.REDUCE:
+        sc = "" if op.x is None else f" (× x{op.x})"
+        return f"REDUCE out[{op.d}] += w{op.n + 1} × |a{op.t}{sc}|²"
+    return f"{o.name} {edge(op.d)}, {op.n} components"
+
+
 def overlaps(a: range, b: range) -> bool:
     return max(a.start, b.start) < min(a.stop, b.stop)
 
