@@ -42,6 +42,15 @@ project is a pac-julia checkout; `manifest.json` records its revision.
   is null), `scalesets`, `instances` (`[stub, scale set]`), `ops`, `amplitudes`, `weights`,
   `group_factor` (`[numerator, denominator]`), `fixed_layout`.
 
+## Where the tests find them
+
+`test/python/test_uir.py` (through `test/python/goldens.py`) compares with every golden set it finds:
+
+- `test/data/goldens/`: committed, the goldens of the fixture exports `test/data/export/*.json`
+  (`--compile-max 0`; `manifest.json`, `programs.json`, `lowered/` and `kernels/` only), so the
+  tests run anywhere;
+- the corpus: `PACRUNNER_GOLDENS`, else `~/symjit-data/pacrunner-goldens` when it exists.
+
 ## Checks of the goldens themselves (2026-11-20, pac-julia 8a666da)
 
 Corpus: the eight pyAmpliCol 1.0.2 reference exports (`~/pyamplicol-1.0/exports2ref` on the x86-64

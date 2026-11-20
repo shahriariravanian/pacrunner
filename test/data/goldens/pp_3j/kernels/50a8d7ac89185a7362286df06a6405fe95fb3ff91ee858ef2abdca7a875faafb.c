@@ -1,0 +1,84 @@
+/* the symjit kernel k_50a8d7ac89185a73 (72 MIR instructions), from its .plane.symjit by kernel_c.jl */
+PAC_FN static int k_50a8d7ac89185a73(double *mem) {
+double stack2 = 0.0, stack144 = 0.0, stack145 = 0.0, stack146 = 0.0, stack147 = 0.0;
+double g0 = 0.0, g1 = 0.0, g2 = 0.0, g3 = 0.0, g4 = 0.0, g5 = 0.0, g6 = 0.0, g7 = 0.0, g8 = 0.0, g9 = 0.0, r0 = 0.0, r1 = 0.0, g10 = 0.0, g11 = 0.0, g12 = 0.0, g13 = 0.0;
+int ret = -1;
+g4 = 0.5;
+g5 = sj_xor(g5, g5);
+g0 = g4;
+g1 = g5;
+ret = 0; goto L__40_complex_root; R_0:;
+g4 = r0;
+g5 = r1;
+goto L__40_jump_over_complex_root;
+L__40_complex_root:;
+g2 = sj_xor(g2, g2);
+g2 = sj_mask(g2 < g0);
+stack2 = g2;
+g2 = g0 * g0;
+g2 = fma(g1, g1, g2);
+g2 = sqrt(g2);
+g3 = fabs(g0);
+g2 = g2 + g3;
+g2 = g2 * 0.5;
+g2 = sqrt(g2);
+g3 = g1 / g2;
+g3 = g3 * 0.5;
+g0 = sj_mask(g3 == g3);
+g3 = sj_and(g3, g0);
+g0 = stack2 != 0.0 ? g2 : g3;
+g1 = stack2 != 0.0 ? g3 : g2;
+g2 = sj_sign(g0);
+r0 = sj_xor(g0, g2);
+r1 = sj_xor(g1, g2);
+goto L_return;
+L__40_jump_over_complex_root:;
+stack144 = g4; stack145 = g5;
+g6 = mem[6]; g7 = mem[7];
+g3 = -g7;
+g9 = g6;
+g8 = g3;
+g10 = mem[4]; g11 = mem[5];
+g0 = mem[10]; g1 = mem[11];
+g12 = g10 + g0; g13 = g11 + g1;
+g3 = -g13;
+g13 = g12;
+g12 = g3;
+g0 = mem[0]; g1 = mem[1];
+g2 = g13 * g1; g2 = fma(g12, g0, -g2); g3 = g12 * g1; g13 = fma(g0, g13, g3); g12 = g2;
+g0 = mem[8]; g1 = mem[9];
+g4 = g8 + g0; g5 = g9 + g1;
+r0 = mem[2]; r1 = mem[3];
+g2 = g5 * r1; g2 = fma(g4, r0, -g2); g3 = g4 * r1; r1 = fma(r0, g5, g3); r0 = g2;
+g4 = r0 + g12; g5 = r1 + g13;
+g0 = stack144; g1 = stack145;
+g2 = g5 * g1; g2 = fma(g4, g0, -g2); g3 = g4 * g1; g5 = fma(g0, g5, g3); g4 = g2;
+stack146 = g4; stack147 = g5;
+g0 = mem[8]; g1 = mem[9];
+g12 = g8 - g0; g13 = g9 - g1;
+g0 = mem[0]; g1 = mem[1];
+g2 = g13 * g1; g2 = fma(g12, g0, -g2); g3 = g12 * g1; g13 = fma(g0, g13, g3); g12 = g2;
+g3 = -g11;
+g5 = g10;
+g4 = g3;
+g6 = mem[10]; g7 = mem[11];
+g3 = g7;
+g7 = -g6;
+g6 = g3;
+g4 = g4 + g6; g5 = g5 + g7;
+r0 = mem[2]; r1 = mem[3];
+g2 = g5 * r1; g2 = fma(g4, r0, -g2); g3 = g4 * r1; r1 = fma(r0, g5, g3); r0 = g2;
+g4 = r0 + g12; g5 = r1 + g13;
+g0 = stack144; g1 = stack145;
+g2 = g5 * g1; g2 = fma(g4, g0, -g2); g3 = g4 * g1; g5 = fma(g0, g5, g3); g4 = g2;
+g6 = stack146; g7 = stack147;
+mem[12] = g6; mem[13] = g7;
+mem[12] = g6; mem[13] = g7;
+mem[14] = g4; mem[15] = g5;
+return 0;
+L_return:
+switch (ret) {
+case 0: goto R_0;
+}
+return -1;  /* a return outside a funclet */
+}

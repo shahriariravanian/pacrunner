@@ -19,4 +19,4 @@ cuda = ["cupy-cuda13x"]
 
 [tool.setuptools]
 # only the Python package: the repository root also holds the Julia sources (src/), C (c/), tests
-packages = ["pacrunner"]
+packages = ["pacrunner", "pacrunner.uir"]
