@@ -1,5 +1,5 @@
-"""A symjit kernel's MIR from symjit's MIR JSON (symjit ≥ 2.29, format "symjit-mir" v1; symjit's
-rust/mir/json.rs): `read_mir(sjb bytes)` calls `symjit.mir_json(bytes, "json-complex")`, which reads
+"""A symjit kernel's MIR from symjit's application JSON (symjit ≥ 2.29, format "symjit-application"
+v1; symjit's rust/mir/json.rs): `read_mir(sjb bytes)` calls `symjit.mir_json(bytes, "json-complex")`, which reads
 the saved application without compiling it and writes its MIR of real operations (a complex model's
 complexified, LoadComplex/SaveComplex and ComplexBi kept). This replaces pac-julia's sjb.jl and
 complexify.jl.
@@ -247,7 +247,7 @@ def double(bits: str) -> float:
 
 # ---- the kernel ---------------------------------------------------------------------------------------------
 
-FORMAT = "symjit-mir"
+FORMAT = "symjit-application"
 FORMAT_VERSION = 1
 
 
@@ -276,16 +276,19 @@ class Mir:
 
 
 def parse_mir(text: Union[str, bytes, dict]) -> Mir:
-    """a Mir from symjit's MIR JSON (format "symjit-mir" v1)"""
+    """a Mir from symjit's application JSON (format "symjit-application" v1: the program in
+    `program`, the MIR in `mir`)"""
     d = text if isinstance(text, dict) else json.loads(text)
     if d.get("format") != FORMAT or d.get("format_version") != FORMAT_VERSION:
         raise MirError(f"format {d.get('format')} v{d.get('format_version')}, this reader takes {FORMAT} v{FORMAT_VERSION}")
-    if d["config"]["options"].get("complex") and not d["complexified"]:
+    (prog, m) = (d["program"], d["mir"])
+    options = dict(prog["config"]["options"])
+    if options.get("complex") and not m["complexified"]:
         raise MirError("a complex model's MIR before complexification (dump it with json-complex)")
-    return Mir(code=tuple(instruction(x) for x in d["code"]), consts=tuple(double(c) for c in d["consts"]),
-               labels=dict(d["labels"]), count_states=int(d["count_states"]), count_params=int(d["count_params"]),
-               count_obs=int(d["count_obs"]), count_diffs=int(d["count_diffs"]), options=dict(d["config"]["options"]),
-               reals=tuple(_loc(x) for x in d["reals"]), complexified=bool(d["complexified"]),
+    return Mir(code=tuple(instruction(x) for x in m["code"]), consts=tuple(double(c) for c in m["consts"]),
+               labels=dict(m["labels"]), count_states=int(prog["count_states"]), count_params=int(prog["count_params"]),
+               count_obs=int(prog["count_obs"]), count_diffs=int(prog["count_diffs"]), options=options,
+               reals=tuple(_loc(x) for x in d["reals"]), complexified=bool(m["complexified"]),
                symjit_version=str(d["symjit_version"]))
 
 

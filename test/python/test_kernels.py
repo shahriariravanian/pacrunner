@@ -125,10 +125,13 @@ class Literals(unittest.TestCase):
 # a real kernel, by hand: mem[2] = mem[0] / consts[0] (through Ret), mem[3] = |mem[1]| via a funclet
 def _mir_json(code, consts=("0x4000000000000000",), labels=None, **options):
     return json.dumps({
-        "format": "symjit-mir", "format_version": 1, "symjit_version": "2.29.0", "complexified": False,
-        "count_states": 2, "count_params": 0, "count_obs": 2, "count_diffs": 0, "reals": [], "code": code,
-        "consts": list(consts), "labels": labels or {},
-        "config": {"ty": "native", "options": {"complex": False, "direct_arena": True, **options}},
+        "format": "symjit-application", "format_version": 1, "symjit_version": "2.29.0",
+        "program": {"count_states": 2, "count_params": 0, "count_obs": 2, "count_diffs": 0, "count_loops": 0,
+                    "config": {"ty": "native", "options": {"complex": False, "direct_arena": True, **options}},
+                    "builder": {"count_loops": 0, "count_stack": 0, "consts": list(consts), "ft": []}},
+        "prepared": {"compiled": True, "fast": False, "simd": False},
+        "mir": {"complexified": False, "code": code, "consts": list(consts), "labels": labels or {}},
+        "reals": [],
     })
 
 
