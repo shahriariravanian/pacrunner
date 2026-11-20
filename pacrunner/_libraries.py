@@ -270,10 +270,6 @@ class Provider:
                                      incoming_count=incoming_count),
                 self.flavor_arguments(channel))
 
-    # the name before 0.2 (one release)
-    def mad_artifact(self):
-        return self.subprocess
-
 
 class _ContextLibraries:
     """load_libraries' result (the earlier utils/libraries.py API, for code written against it): a
@@ -316,8 +312,3 @@ def load_libraries(context, out, parameters=None, param_card=""):
     made): the earlier utils/libraries.py API (runtime() a madspace.FunctionRuntime). New code:
     Provider(out).runtime(channel) (a pacrunner.Runtime, the context made for the libraries' device)."""
     return _ContextLibraries(context, out, parameters, param_card)
-
-
-# the names before 0.2 (one release)
-PacLibrary = Provider
-MadLibrary = Provider

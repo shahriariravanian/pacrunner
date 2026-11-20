@@ -63,7 +63,6 @@ FTEMPLATE = Field(32, 16, 8, 0)   # a SOURCE's N: word 0 only (its high bits wou
 FE = Field(48, 10, 8, 10)         # a SOURCE's embedding (its L): above its template
 FW = Field(32, 16, 8, 14)         # a REDUCE's weight (its N): high bits below T's in word 1
 EXT = 1 << 5
-WORD = (1 << 64) - 1
 
 
 def _none(f: Field, wide: bool) -> int:

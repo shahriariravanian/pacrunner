@@ -155,13 +155,6 @@ class Output:
                 raise _env.PacRunnerError(f"{p.folder}: a provider of {p.output}, not of {self.path}")
         return _mgrun.run_libraries(self.path, providers, args=args, in_process=in_process, log=log)
 
-    # the names before 0.2 (one release)
-    def artifact(self, name=None):
-        return self.subprocess(name)
-
-    def artifacts(self):
-        return self.subprocesses()
-
 
 class SubProcess:
     """One pyAmpliCol subprocess of a MadGraph7 output (SubProcesses/<name>), with one of its artifact's
@@ -280,15 +273,3 @@ class SubProcess:
         if not (folder / "umami_pac.json").is_file():
             raise _env.PacRunnerError(f"{folder}: not compiled (SubProcess.compile)")
         return Provider(folder)
-
-    # the names before 0.2 (one release)
-    def library(self, device="cpu", precision="f64"):
-        return self.compiled(device, precision)
-
-    def library_folder(self, device="cpu", precision="f64"):
-        return self.provider_folder(device, precision)
-
-
-# the names before 0.2 (one release)
-MadOutput = Output
-MadArtifact = SubProcess

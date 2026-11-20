@@ -73,10 +73,6 @@ class Table:
         return len(self.values)
 
 
-def is_one(z: complex) -> bool:
-    return complex_key(z) == complex_key(1.0 + 0.0j)
-
-
 # ---- validate -----------------------------------------------------------------------------------------
 
 def _inrange(i: Optional[int], n: int) -> bool:

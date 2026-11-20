@@ -232,7 +232,3 @@ class Artifact:
                         quiet=True)
         (folder / STAMP).write_text(json.dumps(stamp, indent=1))
         return Provider(folder)
-
-
-# the name before 0.2 (one release)
-PacArtifact = Artifact

@@ -167,24 +167,5 @@ class OutputRuns(unittest.TestCase):
         self.check_events(r, lambda larger: larger)
 
 
-@unittest.skipUnless(OUTPUT, "PACRUNNER_TEST_MG7_MULTI not set")
-class OldNames(unittest.TestCase):
-    def test_the_0_1_names_still_work(self):
-        # aliases for one release
-        self.assertIs(pacrunner.MadOutput, pacrunner.Output)
-        self.assertIs(pacrunner.MadArtifact, pacrunner.SubProcess)
-        self.assertIs(pacrunner.PacArtifact, pacrunner.Artifact)
-        self.assertIs(pacrunner.PacLibrary, pacrunner.Provider)
-        self.assertIs(pacrunner.MadLibrary, pacrunner.Provider)
-        out = pacrunner.Output(OUTPUT)
-        s = out.subprocess(out.names[0])
-        s.compile(device="cpu")   # its own build (OutputRuns, which also makes it, runs after this class)
-        # a stock library's name (subprocess_provider) still names a subprocess, as MadArtifact's did
-        self.assertEqual(out.artifact(s.library_name).name, s.name)
-        self.assertEqual([a.library_name for a in out.artifacts()], [a.library_name for a in out.subprocesses()])
-        self.assertEqual(s.library().folder, s.compiled().folder)
-        self.assertEqual(s.compiled().mad_artifact().name, s.name)
-
-
 if __name__ == "__main__":
     unittest.main()
