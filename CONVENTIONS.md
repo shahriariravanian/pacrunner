@@ -4,7 +4,7 @@ The legend that pac2json wrote into v1's `main.json` as `configs.conventions` an
 kept here word for word. pacrunner no longer reads `main.json` (it reads RustiCol's recurrence export,
 `pacrunner.uir.load_recurrence_export`), and the field names below are `main.json`'s, but the meaning
 is unchanged: it is that of a UIR program (`pacrunner/uir/types.py`) and of the C that runs it,
-`c/pacops.c` (the sources and the instructions). The names `c<i>`, `q<i>`, `s<i>`, `x<i>`, `a<i>`
+`pacrunner/c/pacops.c` (the sources and the instructions). The names `c<i>`, `q<i>`, `s<i>`, `x<i>`, `a<i>`
 are those of the generated C's comments (`pacrunner.uir.describe`).
 
 ## Conventions

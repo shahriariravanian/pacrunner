@@ -12,6 +12,7 @@ The export and the stock library's build use the pyAmpliCol installation that pr
 (pacrunner._pyamplicol: found by its revision, or configure(pyamplicol=...)). An artifact may hold
 several UMAMI providers (API/umami/metadata.json an index): pick one with `provider=`."""
 
+import hashlib
 import json
 import os
 import subprocess
@@ -30,15 +31,32 @@ def _read(path):
 
 
 def _git_revision(folder):
-    """this repository's revision, '+' when its Python or C sources differ from it (None without git)"""
+    """this repository's revision, '+' when its Python or C sources (pacrunner/) differ from it (None
+    without git)"""
     try:
         head = subprocess.run(["git", "-C", os.fspath(folder), "rev-parse", "HEAD"], capture_output=True, text=True,
                               check=True).stdout.strip()
-        dirty = subprocess.run(["git", "-C", os.fspath(folder), "status", "--porcelain", "--", "pacrunner", "c"],
+        dirty = subprocess.run(["git", "-C", os.fspath(folder), "status", "--porcelain", "--", "pacrunner"],
                                capture_output=True, text=True, check=True).stdout.strip()
         return head + ("+" if dirty else "")
     except (OSError, subprocess.CalledProcessError):
         return None
+
+
+def _sources_digest():
+    """pacrunner's version and a hash of its Python and C sources (an installed copy, or a clone without git)"""
+    from . import __version__
+    h = hashlib.sha256()
+    for f in sorted(p for p in _env.PACKAGE.rglob("*") if p.is_file() and "__pycache__" not in p.parts):
+        h.update(f.relative_to(_env.PACKAGE).as_posix().encode() + b"\0" + f.read_bytes() + b"\0")
+    return f"{__version__}:{h.hexdigest()[:16]}"
+
+
+def source_revision():
+    """what pacrunner's builds are stamped with: the clone's git revision ('+' when dirty: builds are not
+    reused), else the version and a hash of the sources"""
+    folder = _env.repository()
+    return (_git_revision(folder) if folder is not None else None) or _sources_digest()
 
 
 class Artifact:
@@ -218,12 +236,13 @@ class Artifact:
         from .kernels import require_symjit, symjit_fingerprint
         from .umami import umami_libraries
         require_symjit()   # symjit >= 2.29, before the export
+        _env.c_sources()   # and the C sources
         device = _env.device_name(device)
         from ._libraries import Provider
         folder = Path(folder) if folder is not None else self.default_folder(device, precision)
         stamp = {"artifact_id": self.id, "provider": self.provider, "device": device, "precision": precision,
                  "interpreter": bool(interpreter), "parameters": dict(sorted((parameters or {}).items())),
-                 "pacrunner": _git_revision(_env.repository()), "symjit": symjit_fingerprint()}   # the kernels' C
+                 "pacrunner": source_revision(), "symjit": symjit_fingerprint()}   # the kernels' C
         if not force and (folder / "umami_pac.json").is_file() and (folder / STAMP).is_file():
             if _read(folder / STAMP) == stamp and stamp["pacrunner"] is not None and not stamp["pacrunner"].endswith("+"):
                 return Provider(folder)

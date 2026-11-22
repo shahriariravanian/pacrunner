@@ -12,9 +12,9 @@ for MadGraph7 and MadSpace. Two layers:
     passes, the encoding), pacrunner.kernels (the symjit kernels' MIR and C), pacrunner.codegen (a
     program as C) and pacrunner.umami (the UMAMI libraries; also `python -m pacrunner.umami`).
 
-Setup: this repository cloned and installed with `python -m pip install -e .`, symjit >= 2.29 (conda
-install -c conda-forge 'symjit>=2.29': the kernels' MIR), a C compiler (nvcc for the GPU), a MadGraph7
-checkout with MadSpace for running libraries:
+Setup: this repository cloned and installed with `python -m pip install -e .` (or not editable),
+symjit >= 2.29 (a pip requirement, or from conda-forge: the kernels' MIR), a C compiler (nvcc for the
+GPU), a MadGraph7 checkout with MadSpace for running libraries:
 
     import pacrunner
     pacrunner.configure(madgraph7="~/MadGraph7")      # or PACRUNNER_MADGRAPH7

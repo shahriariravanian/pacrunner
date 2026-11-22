@@ -1,4 +1,4 @@
-"""Where pacrunner's tools are: this repository (its C sources, c/), a MadGraph7 checkout with its
+"""Where pacrunner's tools are: its C sources (pacrunner/c/), a MadGraph7 checkout with its
 MadSpace (CPU or CUDA build) and pyAmpliCol. Set with pacrunner.configure(...), else from the
 environment (PACRUNNER_MADGRAPH7, PACRUNNER_PYAMPLICOL), else found."""
 
@@ -12,9 +12,11 @@ class PacRunnerError(RuntimeError):
     """A pacrunner setup or use error, with what to do about it"""
 
 
-# the repository: this package's parent folder, with the C sources the libraries are built from (c/)
-# (pacrunner is installed editable, from a clone)
-REPOSITORY = Path(__file__).resolve().parent.parent
+# the package, and the C sources the libraries are built from (package data: pacrunner/c/)
+PACKAGE = Path(__file__).resolve().parent
+C_DIR = PACKAGE / "c"
+# the clone pacrunner is installed from, editable (its parent folder); not one for an installed copy
+REPOSITORY = PACKAGE.parent
 
 
 DEVICE_ALIASES = {"cuda_full": "cuda_provider"}   # cuda_full: everything on the GPU (MadSpace's GPU runtime)
@@ -25,11 +27,19 @@ def device_name(device: str) -> str:
     return DEVICE_ALIASES.get(device, device)
 
 
-def repository() -> Path:
-    if not (REPOSITORY / "c" / "umami_pac.c").is_file() or not (REPOSITORY / "c" / "pacops.c").is_file():
-        raise PacRunnerError(f"{REPOSITORY}: not the pacrunner repository (no c/umami_pac.c, c/pacops.c): "
-                             "install pacrunner from a clone, `python -m pip install -e .` in it")
-    return REPOSITORY
+def c_sources() -> Path:
+    """the C sources' folder (pacrunner/c/), checked"""
+    if not (C_DIR / "umami_pac.c").is_file() or not (C_DIR / "pacops.c").is_file():
+        raise PacRunnerError(f"{C_DIR}: no umami_pac.c, pacops.c: pacrunner is installed without its C sources "
+                             "(package data); reinstall it")
+    return C_DIR
+
+
+def repository() -> Path | None:
+    """the git clone pacrunner runs from (installed editable), else None (an installed copy)"""
+    if (REPOSITORY / "pyproject.toml").is_file() and (REPOSITORY / ".git").exists():
+        return REPOSITORY
+    return None
 
 
 @dataclass

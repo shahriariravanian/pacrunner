@@ -38,7 +38,8 @@ generators and [MadGraph](https://github.com/MadGraphTeam/MadGraph7) ecosystem.
    symjit kernels of a program, and checks its version (that of symjit's native library) before it
    builds anything.
 5. Clone PacRunner: `git clone https://github.com/shahriariravanian/pacrunner`, then `cd pacrunner`.
-6. Install it, editable: `python -m pip install -e .` (the package finds its C sources, `c/`, beside it).
+6. Install it, editable: `python -m pip install -e .` (a plain `python -m pip install .` works too: the C
+   sources, `pacrunner/c/`, are package data; editable is for working on PacRunner).
 7. Point PacRunner at the MadGraph7 checkout: `export PACRUNNER_MADGRAPH7=/path/to/MadGraph7`, or
    `pacrunner.configure(madgraph7="/path/to/MadGraph7")` before the first runtime. PacRunner then
    imports MadSpace from `madspace/install-cuda` when it exists and from `madspace/install` otherwise

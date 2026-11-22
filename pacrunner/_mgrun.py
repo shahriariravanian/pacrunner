@@ -78,9 +78,13 @@ def _runner(output, runner_args, args, log, python, what):
         result = Path(tmp) / "result.json"
         command = [python or output_python(output), "-m", "pacrunner._madgraph", "--json", os.fspath(result),
                    *runner_args, "--", *(args or ["-f"])]
+        # this pacrunner first on the output python's path, alone: a folder with a link to the package
+        # (not its parent, which for an installed copy is all of site-packages)
+        path = Path(tmp) / "path"
+        path.mkdir()
+        (path / "pacrunner").symlink_to(_env.PACKAGE, target_is_directory=True)
         env = dict(os.environ)
-        env["PYTHONPATH"] = os.pathsep.join([os.fspath(_env.repository())] +
-                                            ([env["PYTHONPATH"]] if env.get("PYTHONPATH") else []))
+        env["PYTHONPATH"] = os.pathsep.join([os.fspath(path)] + ([env["PYTHONPATH"]] if env.get("PYTHONPATH") else []))
         env.setdefault("XDG_RUNTIME_DIR", os.path.expanduser("~/.cache/xdg-runtime"))
         os.makedirs(env["XDG_RUNTIME_DIR"], exist_ok=True)
         out = open(log, "w") if log is not None else None

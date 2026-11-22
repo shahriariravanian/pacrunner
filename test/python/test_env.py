@@ -17,11 +17,29 @@ from pacrunner import _env
 
 
 class Repository(unittest.TestCase):
-    def test_repository_has_the_c_sources(self):
+    def test_the_package_has_the_c_sources(self):
+        c = _env.c_sources()
+        self.assertEqual(c, Path(pacrunner.__file__).resolve().parent / "c")
+        self.assertTrue((c / "umami_pac.c").is_file())
+        self.assertTrue((c / "pacops.c").is_file())
+
+    def test_repository_is_the_clone(self):
+        # these tests run from the clone (installed editable)
         root = pacrunner.repository()
-        self.assertTrue((root / "c" / "umami_pac.c").is_file())
-        self.assertTrue((root / "c" / "pacops.c").is_file())
         self.assertEqual(root, Path(pacrunner.__file__).resolve().parent.parent)
+        self.assertTrue((root / "pyproject.toml").is_file())
+
+    def test_an_installed_copy_has_no_repository(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(_env, "REPOSITORY", Path(tmp)):
+            self.assertIsNone(pacrunner.repository())
+
+    def test_source_revision(self):
+        from pacrunner import _artifacts
+        digest = _artifacts._sources_digest()
+        self.assertTrue(digest.startswith(pacrunner.__version__ + ":"), digest)
+        self.assertEqual(digest, _artifacts._sources_digest())
+        with mock.patch.object(_env, "repository", lambda: None):
+            self.assertEqual(_artifacts.source_revision(), digest)
 
 
 class NoJulia(unittest.TestCase):
@@ -53,7 +71,7 @@ class MadGraph7(unittest.TestCase):
             self.assertEqual(r.returncode, 0, r.stderr)
             self.assertIn("site-packages", r.stdout)
         hidden = ("import sys; sys.path = [p for p in sys.path if 'site-packages' not in p]; "
-                  f"sys.path.insert(0, {os.fspath(_env.REPOSITORY)!r}); from pacrunner import _env\n"
+                  f"sys.path.insert(0, {os.fspath(_env.PACKAGE.parent)!r}); from pacrunner import _env\n"
                   "try:\n    _env.import_madspace()\nexcept _env.PacRunnerError as e:\n    print('error:', e)")
         r = subprocess.run([sys.executable, "-c", hidden], capture_output=True, text=True, env=env)
         self.assertIn("error: no MadSpace", r.stdout, r.stderr)

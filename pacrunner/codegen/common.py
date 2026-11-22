@@ -11,12 +11,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Sequence
 
+from .. import _env
 from .._literal import julia_repr
 from ..kernels import KERNEL_PRELUDE, Mir, kernel_c, kernel_c_mixed, read_mir
 from ..uir import Kernel, Lowered
 
-# the C sources (pacops, the interpreter, the GPU pool): the repository's c/ folder
-C_DIR = Path(__file__).resolve().parents[2] / "c"
+# the C sources (pacops, the interpreter, the GPU pool): the package's c/ folder
+C_DIR = _env.C_DIR
 
 
 class CompileError(ValueError):
