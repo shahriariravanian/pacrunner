@@ -23,8 +23,8 @@ class Repository(unittest.TestCase):
         self.assertTrue((c / "umami_pac.c").is_file())
         self.assertTrue((c / "pacops.c").is_file())
 
+    @unittest.skipIf(_env.repository() is None, "pacrunner is an installed copy, not the clone")
     def test_repository_is_the_clone(self):
-        # these tests run from the clone (installed editable)
         root = pacrunner.repository()
         self.assertEqual(root, Path(pacrunner.__file__).resolve().parent.parent)
         self.assertTrue((root / "pyproject.toml").is_file())

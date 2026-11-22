@@ -297,7 +297,7 @@ def parse_mir(text: Union[str, bytes, dict]) -> Mir:
 
 
 SYMJIT_REQUIRED = (2, 29, 0)
-SYMJIT_INSTALL = "conda install -c conda-forge 'symjit>=2.29'"
+SYMJIT_INSTALL = "python -m pip install 'symjit>=2.29.1', or conda install -c conda-forge 'symjit>=2.29'"
 
 
 def symjit_version() -> Optional[str]:

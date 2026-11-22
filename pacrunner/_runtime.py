@@ -123,7 +123,7 @@ class Runtime:
         try:
             import cupy
         except ImportError as e:
-            raise _env.PacRunnerError("a CUDA runtime needs CuPy (`python -m pip install -e .[cuda]`)") from e
+            raise _env.PacRunnerError("a CUDA runtime needs CuPy (pacrunner's `cuda` extra, or `python -m pip install cupy-cuda13x`)") from e
         outs = rt.call([cupy.asarray(a) for a in args])
         cupy.cuda.runtime.deviceSynchronize()
         return [cupy.from_dlpack(x) if device_in else cupy.from_dlpack(x).get() for x in outs]
