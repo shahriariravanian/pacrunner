@@ -229,6 +229,41 @@ print(provider_gpu.run().cross_section)    # should print about 94.4 (pb, ± 0.2
 The leading-colour cross section is larger than the full-colour one (about 94.4 against 75.5 pb for
 this process): the colour approximation, not a GPU difference.
 
+## Benchmarks
+
+`u u~ > z g g g g`, one MadGraph7 `generate_events` run of 100k events per mode, on three machines.
+
+**Wall clock (s)**
+
+| Mode | Precision | RTX 5060 + Ryzen 9900X | H100 + EPYC 9334 | M4 Mac mini |
+| --- | --- | ---: | ---: | ---: |
+| stock (pyAmpliCol) | f64 | 95.4 | 126.4 | 129.9 |
+| `cpu` | f64 | 44.4 | 48.5 | 58.4 |
+| `gpu` (cuda / metal) | f64 | 28.6 | 11.6 | — |
+| `gpu` (cuda / metal) | mixed | 15.6 | 11.2 | 24.9 |
+| `cuda_full` | f64 | 38.1 | 6.78 | — |
+| `cuda_full` | mixed | 15.3 | 5.31 | — |
+
+**Matrix element per point (µs)**: the time inside the matrix-element library per event, summed over
+MadSpace's threads.
+
+| Mode | Precision | RTX 5060 + Ryzen 9900X | H100 + EPYC 9334 | M4 Mac mini |
+| --- | --- | ---: | ---: | ---: |
+| stock (pyAmpliCol) | f64 | 61.6 | 80.9 | 42.0 |
+| `cpu` | f64 | 23.6 | 23.3 | 15.7 |
+| `gpu` (cuda / metal) | f64 | 15.1 | 0.889 | — |
+| `gpu` (cuda / metal) | mixed | 1.08 | 0.550 | 2.54 |
+| `cuda_full` | f64 | 1.18\* | 0.158\* | — |
+| `cuda_full` | mixed | 0.254\* | 0.091\* | — |
+
+- Wall times: the fastest of 3 untimed runs (RTX 5060, H100); one untimed run after a warm-up (M4).
+- `gpu` is CUDA on the RTX 5060 and H100, Metal on the M4 (mixed precision only; no `cuda_full`
+  counterpart).
+- Per-point times for `gpu` include threads waiting for the shared GPU. \* `cuda_full`: measured
+  outside mg7 in synchronized 64k-event batches.
+- MadSpace threads: 24 (RTX 5060, H100), 10 (M4). MadGraph7 2079d93; fixed scales, NNPDF23, seed 7,
+  64k batches, leading colour.
+
 ## pyAmpliCol 1.0.x: RustiCol's recurrence export
 
 pyAmpliCol 1.0.x writes an LC artifact's programs itself: `pyamplicol export-recurrence LC_DIR -o
