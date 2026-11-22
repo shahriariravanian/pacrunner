@@ -1,0 +1,803 @@
+"""compile_simd(path, l): a program as one symjit kernel, for device "simd": the program's rows spliced
+from the library of pacops operations (pacrunner/simd/: symjit fragments, pacops.c's bits) into one
+symjit application (symjit's "symjit-application" JSON), compiled by symjit's JIT into its SIMD kernels,
+AVX2 (4 points a call) and AVX-512 (8, where the building CPU has it), whose machine code simd/elf.py wraps
+in object files (no relocations: the kernels call no function). The values are the straight-line C
+runner's (codegen/compile.py) bit for bit.
+
+The kernel: its states are the caller's momenta (E, px, py, pz per leg: Mem 0 .. 4 × legs), its outputs
+the helicity outputs (Mem 4 × legs ..). runner.c's arena (forms, amplitudes, planes: ArenaIndex) is in
+symjit stack slots, after the fragments' own slots, then a scratch area, the per-row constants and the
+result area of the called fragments. The rows:
+
+  - vertices, propagators, wavefunctions and model kernels are compress-mode subroutines (symjit's
+    `topology.rs` and `statement.rs` layout): one body each after `@success`, entered at
+    `@f_<name>_ultra` (SaveArgs ultra: the first 16 arguments passed as their stack slots' numbers,
+    packed four to a register, and gathered into the argument area Stack(16 + k)), its outputs written
+    to the result area and copied to their currents by the caller. A call site is LoadArgs (ultra),
+    Call, the copies. The body's inputs that are the same constant at every call site are constants
+    of the body; the per-row ones are stack slots filled at the start (ultra takes stack slots only).
+    So the kernel's code stays small (straight-line code of a large program would be fetched from L3
+    for every point: pacrunner's plans/CPU-KERNEL.md).
+  - closures are inlined (their library fragments); forms, clears, copies, scatters, scales, source
+    factors (plain and embedded), the reduction and the group factor are written here as MIR, in
+    pacops' order (pacops.c is the reference).
+  - a model kernel (KERNEL rows) is its application's MIR of real operations (kernels/mir.py's
+    json-complex) rewritten for a real application as kernel_c.py runs it: LoadComplex/SaveComplex as
+    two loads/stores, ComplexBi × and ÷ as kernel_c's fused sequences (through Gen(2), Gen(3), Temp),
+    Real/Conjugate/Imaginary/Abs2 as their real meaning; its funclets stay (internal calls).
+
+The folder: kernel.json (the application), runner.h (the program's sizes and names, as
+compile.py's), and per lane count L in `lanes` kernel<L>.o and kernel<L>.h (the kernel pac_simd<L>).
+"""
+from __future__ import annotations
+
+import copy
+import json
+import math
+import struct
+from pathlib import Path
+from typing import Optional, Sequence
+
+from ..simd import library
+from ..uir import (InputKind, Lowered, Opcode, PhysicalType, is_kernel, is_propagator, is_vertex, source_fields,
+                   validate)
+from .common import ArenaIndex, CompileError, cstring
+
+SQH = math.sqrt(0.5)
+VERTEX = {Opcode.V_WEYL_VECTOR_A: "weyl_vector_a", Opcode.V_WEYL_VECTOR_B: "weyl_vector_b",
+          Opcode.V_TENSOR_VECTOR: "tensor_vector", Opcode.V_VECTOR_WEDGE: "vector_wedge",
+          Opcode.V_THREE_VECTOR: "three_vector"}
+PROPAGATOR = {Opcode.P_WEYL_A: "weyl_a", Opcode.P_WEYL_B: "weyl_b", Opcode.P_VECTOR: "vector"}
+READS = {"Load", "LoadMath", "LoadComplex"}
+WRITES = {"Save", "SaveComplex"}
+ARG_AREA = 16        # config.location(k) = Stack(SPILL_AREA + k): the compress-mode argument area
+ARGS_CAP = 64        # COMPRESSED_ARGS_CAP: a body's arguments
+PACKED = 16          # the arguments passed by slot number (the x86-64 entry: 16 vector registers)
+LANES = (4, 8)
+
+
+class SimdError(CompileError):
+    pass
+
+
+def bits(x: float) -> str:
+    return "0x%016x" % struct.unpack("<Q", struct.pack("<d", float(x)))[0]
+
+
+def cmul(a: complex, b: complex) -> complex:
+    """pacops mul(a, b) on doubles (Python floats are IEEE doubles, no fma)"""
+    return complex(a.real * b.real - a.imag * b.imag, a.real * b.imag + a.imag * b.real)
+
+
+def G(n):
+    return {"Gen": n}
+
+
+def called(name: str) -> bool:
+    """the fragments that are subroutines (the rest is inlined)"""
+    return name.startswith(("vertex:", "propagator:", "wave:", "kernel:"))
+
+
+# ---- model kernels: real MIR -------------------------------------------------------------------------------
+
+def _loc_plus(loc: dict, k: int) -> dict:
+    ((kind, i),) = loc.items()
+    return {kind: i + k}
+
+
+def kernel_fragment(k) -> dict:
+    """a model kernel (uir Kernel) as a library-style fragment: its application's real MIR (json-complex)
+    rewritten for a real application (see the module); inputs x0 .. (the stub's), outputs its pairs"""
+    import symjit
+    app = json.loads(symjit.mir_json(k.application, "json-complex"))
+    prog = app["program"]
+    consts = list(app["mir"]["consts"])
+
+    def const(x):
+        b = bits(x)
+        if b not in consts:
+            consts.append(b)
+        return consts.index(b)
+
+    out = []
+    for ins in app["mir"]["code"]:
+        if isinstance(ins, str):
+            if ins in ("Nop", "End"):
+                continue
+            raise SimdError(f"kernel {k.name}: the instruction {ins}")
+        ((ty, b),) = ins.items()
+        if ty == "LoadComplex":
+            out += [{"Load": {"dst": b["xd"], "loc": b["loc"]}}, {"Load": {"dst": b["yd"], "loc": _loc_plus(b["loc"], 1)}}]
+        elif ty == "SaveComplex":
+            out += [{"Save": {"loc": b["loc"], "src": b["xs"]}}, {"Save": {"loc": _loc_plus(b["loc"], 1), "src": b["ys"]}}]
+        elif ty == "ComplexBi":
+            xd, yd, x1, y1, x2, y2 = (b[f] for f in ("xd", "yd", "x1", "y1", "x2", "y2"))
+            if b["op"] in ("Plus", "Minus"):
+                out += [{"Bi": {"op": b["op"], "dst": xd, "s1": x1, "s2": x2}},
+                        {"Bi": {"op": b["op"], "dst": yd, "s1": y1, "s2": y2}}]
+            elif b["op"] == "Times":     # kernel_c: xt = y1 y2; xt = fma(x1, x2, -xt); yt = x1 y2; yd = fma(x2, y1, yt); xd = xt
+                xt, yt = G(2), G(3)
+                out += [{"Bi": {"op": "Times", "dst": xt, "s1": y1, "s2": y2}},
+                        {"Fused": {"op": "MulSub", "dst": xt, "a": x1, "b": x2, "c": xt}},
+                        {"Bi": {"op": "Times", "dst": yt, "s1": x1, "s2": y2}},
+                        {"Fused": {"op": "MulAdd", "dst": yd, "a": x2, "b": y1, "c": yt}},
+                        {"Mov": {"dst": xd, "s1": xt}}]
+            elif b["op"] == "Divide":    # kernel_c's ÷ (t: Temp)
+                xt, yt, t = G(2), G(3), "Temp"
+                out += [{"Bi": {"op": "Times", "dst": xt, "s1": y1, "s2": y2}},
+                        {"Fused": {"op": "MulAdd", "dst": xt, "a": x1, "b": x2, "c": xt}},
+                        {"Bi": {"op": "Times", "dst": yt, "s1": x1, "s2": y2}},
+                        {"Fused": {"op": "MulSub", "dst": yt, "a": x2, "b": y1, "c": yt}},
+                        {"Bi": {"op": "Times", "dst": t, "s1": x2, "s2": x2}},
+                        {"Fused": {"op": "MulAdd", "dst": t, "a": y2, "b": y2, "c": t}},
+                        {"Bi": {"op": "Divide", "dst": xd, "s1": xt, "s2": t}},
+                        {"Bi": {"op": "Divide", "dst": yd, "s1": yt, "s2": t}}]
+            else:
+                raise SimdError(f"kernel {k.name}: the complex operation {b['op']}")
+        elif ty == "Uni" and b["op"] in ("Real", "Conjugate"):
+            out.append({"Mov": {"dst": b["dst"], "s1": b["s1"]}})
+        elif ty == "Uni" and b["op"] == "Imaginary":
+            out.append({"LoadConst": {"dst": b["dst"], "idx": const(0.0)}})
+        elif ty == "Uni" and b["op"] == "Abs2":
+            out.append({"Bi": {"op": "Times", "dst": b["dst"], "s1": b["s1"], "s2": b["s1"]}})
+        elif ty == "Call" and b["num_args"] != 0:
+            raise SimdError(f"kernel {k.name}: a call of {b['label']} (math functions are not supported)")
+        elif ty in ("LoadArgs", "SaveArgs"):
+            raise SimdError(f"kernel {k.name}: a compressed kernel")
+        else:
+            out.append({ty: b})
+    text = json.dumps(out)
+    if '"Static"' in text or '"Param"' in text:
+        raise SimdError(f"kernel {k.name}: static registers or parameters")
+    stack = [int(x) for x in __import__("re").findall(r'"Stack": (\d+)', text)]
+    return {"name": f"kernel:{k.sha256}", "inputs": [f"x{i}" for i in range(prog["count_states"])],
+            "outputs": prog["count_obs"], "count_stack": max([0, *stack]) + 2, "consts": consts, "code": out}
+
+
+# ---- the assembler -----------------------------------------------------------------------------------------
+
+class CallSite:
+    def __init__(self, name, inputs, outputs):
+        self.name, self.inputs, self.outputs = name, inputs, outputs
+
+
+class Assembler:
+    """one program's kernel (see the module): rows() walks the program as compile.py's compile_op,
+    finish() lays out the calls and the bodies, application() is the JSON"""
+
+    def __init__(self, prog: Lowered, call=called):
+        validate(prog)
+        self.prog, self.b = prog, ArenaIndex.of(prog)
+        self.code, self.consts, self.cidx = [], [], {}
+        self.frags = {}
+        self.rows_done = 0
+        self.scratch_used = 0
+        self.call = call
+        self.sites = {}
+        self.cslots = {}
+        self.results = 0
+        self.bodies = []
+        self.T = None
+
+    # ---- slots and constants ----
+    def const(self, x) -> int:
+        k = bits(x)
+        if k not in self.cidx:
+            self.cidx[k] = len(self.consts)
+            self.consts.append(k)
+        return self.cidx[k]
+
+    def momentum(self, leg, j):
+        return {"Mem": 4 * leg + j}
+
+    def out(self, h):
+        return {"Mem": 4 * self.prog.legs + h}
+
+    def loc(self, t):
+        if isinstance(t, dict):
+            return t
+        kind, i = t
+        base = self.T
+        if kind == "arena":
+            return {"Stack": base + i}
+        base += self.b.size
+        if kind == "scratch":
+            return {"Stack": base + i}
+        base += self.scratch_used
+        if kind == "cslot":
+            return {"Stack": base + i}
+        base += len(self.cslots)
+        if kind == "result":
+            return {"Stack": base + i}
+        raise KeyError(kind)
+
+    def frag(self, name):
+        if name not in self.frags:
+            if name.startswith("kernel:"):
+                k = next(s.kernel for s in self.prog.stubs if s.kernel.sha256 == name[len("kernel:"):])
+                self.frags[name] = kernel_fragment(k)
+            else:
+                self.frags[name] = library.fragment(name)
+        return self.frags[name]
+
+    # ---- raw MIR ----
+    def emit(self, ins):
+        self.code.append(ins)
+
+    def load(self, r, t):
+        self.emit({"Load": {"dst": G(r), "loc": self.loc(t)}})
+
+    def save(self, t, r):
+        self.emit({"Save": {"loc": self.loc(t), "src": G(r)}})
+
+    def loadc(self, r, x):
+        self.emit({"LoadConst": {"dst": G(r), "idx": self.const(x)}})
+
+    def bi(self, op, d, a, b):
+        self.emit({"Bi": {"op": op, "dst": G(d), "s1": G(a), "s2": G(b)}})
+
+    def cmath(self, op, d, a, x):
+        """d = a op x (x a constant)"""
+        self.emit({"LoadConstMath": {"op": op, "dst": G(d), "s1": G(a), "idx": self.const(x)}})
+
+    def zero(self, targets):
+        self.loadc(0, 0.0)
+        for t in targets:
+            self.save(t, 0)
+
+    def cmul_const(self, re, im, z: complex, a_first: bool):
+        """(g0, g1) = mul(z, w) (a_first: mul(w, z)) of the value w at targets (re, im) and the constant z,
+        in pacops' order: re = a.re b.re - a.im b.im, im = a.re b.im + a.im b.re"""
+        self.load(4, re)
+        self.load(5, im)
+        if a_first:     # mul(w, z): w.re z.re - w.im z.im, w.re z.im + w.im z.re
+            self.cmath("Times", 0, 4, z.real)
+            self.cmath("Times", 1, 5, z.imag)
+            self.bi("Minus", 0, 0, 1)
+            self.cmath("Times", 1, 4, z.imag)
+            self.cmath("Times", 2, 5, z.real)
+            self.bi("Plus", 1, 1, 2)
+        else:           # mul(z, w): z.re w.re - z.im w.im, z.re w.im + z.im w.re
+            self.cmath("Times", 0, 4, z.real)
+            self.cmath("Times", 1, 5, z.imag)
+            self.bi("Minus", 0, 0, 1)
+            self.cmath("Times", 1, 5, z.real)
+            self.cmath("Times", 2, 4, z.imag)
+            self.bi("Plus", 1, 1, 2)
+
+    # ---- fragments ----
+    def inline(self, name, inputs: dict, outputs: list):
+        """the fragment `name` at this row: inputs name -> a target (("arena", i), {"Mem": k}) or a float
+        constant; outputs: the targets of its outputs in order"""
+        d = self.frag(name)
+        names, nout = d["inputs"], d["outputs"]
+        if len(outputs) != nout or set(names) - set(inputs):
+            raise SimdError(f"{name}: {len(outputs)} outputs for {nout}, missing inputs {set(names) - set(inputs)}")
+        if self.call(name):
+            site = CallSite(name, inputs, list(outputs))
+            self.code.append(site)
+            self.sites.setdefault(name, []).append(site)
+            return
+        targets = [inputs[n] for n in names] + list(outputs)
+        if not self._splice(d, targets, check=True):
+            # an in-place hazard (an output read again after a write): the outputs to scratch, then copied
+            scratch = [("scratch", j) for j in range(nout)]
+            self.scratch_used = max(self.scratch_used, nout)
+            self._splice(d, [inputs[n] for n in names] + scratch, check=False)
+            for j, t in enumerate(outputs):
+                self.load(0, ("scratch", j))
+                self.save(t, 0)
+
+    def _splice(self, d, targets, check, dest=None, prefix=None):
+        nin = len(d["inputs"])
+        cmap = {}
+        for k, c in enumerate(d["consts"]):
+            if c not in self.cidx:
+                self.cidx[c] = len(self.consts)
+                self.consts.append(c)
+            cmap[k] = self.cidx[c]
+        prefix = prefix or f"r{self.rows_done}_"
+        out, written = [], set()
+        for ins in d["code"]:
+            if isinstance(ins, str):
+                if ins in ("End", "Nop"):
+                    continue
+                out.append(ins)
+                continue
+            ((ty, body),) = ins.items()
+            body = copy.deepcopy(body)
+            if ty in ("LoadConst", "LoadConstMath"):
+                body["idx"] = cmap[body["idx"]]
+            if "label" in body and not body["label"].startswith("."):
+                body["label"] = prefix + body["label"]
+            for key in ("loc", "cond"):
+                if isinstance(body.get(key), dict) and "Mem" in body[key]:
+                    i = body[key]["Mem"]
+                    t = targets[i]
+                    if isinstance(t, float):
+                        if ty == "Load":
+                            ty, body = "LoadConst", {"dst": body["dst"], "idx": self.const(t)}
+                        elif ty == "LoadMath":
+                            ty, body = "LoadConstMath", {"op": body["op"], "dst": body["dst"], "s1": body["s1"],
+                                                         "idx": self.const(t)}
+                        else:
+                            raise SimdError(f"{d['name']}: a constant input in {ty}")
+                        break
+                    key_t = tuple(self.loc(t).items())[0]
+                    if (ty in READS or key == "cond") and check and i < nin and key_t in written:
+                        return False
+                    if ty in WRITES:
+                        written.add(key_t)
+                    body[key] = self.loc(t)
+            out.append({ty: body})
+        (self.code if dest is None else dest).extend(out)
+        return True
+
+    # ---- the program ----
+    def edge(self, e, j):
+        q = self.b.edge_at(self.prog, e) + 2 * j
+        return ("arena", q), ("arena", q + 1)
+
+    def form(self, f, j):
+        return ("arena", self.b.form_at(f) + j)
+
+    def amp(self, a):
+        q = self.b.amplitude_at(a)
+        return ("arena", q), ("arena", q + 1)
+
+    def current_inputs(self, name, e, n):
+        d = {}
+        for j in range(n):
+            d[f"{name}{j}.re"], d[f"{name}{j}.im"] = self.edge(e, j)
+        return d
+
+    def needed(self):
+        names = {self.frag_name(op) for op in self.prog.ops}
+        return sorted(n for n in names if n)
+
+    def frag_name(self, op):
+        p, o = self.prog, op.op
+        if is_vertex(o):
+            return f"vertex:{VERTEX[o]}:{'set' if op.set else 'add'}"
+        if is_propagator(o):
+            return f"propagator:{PROPAGATOR[o]}"
+        if o == Opcode.CLOSURE:
+            n = len(p.lists[op.t])
+            return f"closure:{n}" if n else None
+        if o == Opcode.SOURCE:
+            return self.wave_name(op)
+        if is_kernel(o):
+            return f"kernel:{p.stubs[p.instances[op.t][0]].kernel.sha256}"
+        return None
+
+    def wave_name(self, op):
+        (family, anti, h, ch) = source_fields(op)
+        mass = self.prog.scales[op.t].real
+        a = "anti" if anti else "part"
+        if family == PhysicalType.WEYL:
+            return f"wave:weyl:{a}:{h}:{ch}"
+        if family == PhysicalType.DIRAC:
+            return f"wave:dirac:{a}:{h}:{'massless' if abs(mass) < 1.0e-8 else 'massive'}"
+        if family == PhysicalType.VECTOR:
+            return f"wave:gluon:{h}" if mass == 0 else f"wave:massive_vector:{h}"
+        if family == PhysicalType.SCALAR:
+            return None
+        raise SimdError(f"a source of family {family}")
+
+    def assemble(self):
+        p, b = self.prog, self.b
+        stacks = [self.frag(n)["count_stack"] for n in self.needed()]
+        self.T = max([80, *stacks])     # the fragments' own slots, from Stack(80) (16 + ARGS_CAP)
+        # run(): the arena and the outputs at zero, then the forms
+        self.zero([("arena", i) for i in range(b.size)])
+        self.zero([self.out(h) for h in range(p.output_count())])
+        for i, f in enumerate(p.forms):
+            for j in range(4):
+                self.loadc(0, 0.0)                      # 0.0 + coef × (sign × momenta[leg]), in term order
+                for (leg, coef) in f.terms:
+                    if p.crossing is None:
+                        self.load(1, self.momentum(leg, j))
+                    else:
+                        (cl, sign) = p.crossing[leg]
+                        self.load(1, self.momentum(cl, j))
+                        self.cmath("Times", 1, 1, float(sign))
+                    self.cmath("Times", 1, 1, float(coef))
+                    self.bi("Plus", 0, 0, 1)
+                self.save(self.form(i, j), 0)
+        for op in p.ops:
+            self.row(op)
+            self.rows_done += 1
+        (num, den) = p.group_factor
+        if num != den:                                  # group(): x × num ÷ den
+            for h in range(p.output_count()):
+                self.load(0, self.out(h))
+                self.cmath("Times", 0, 0, float(num))
+                self.cmath("Divide", 0, 0, float(den))
+                self.save(self.out(h), 0)
+        self.finish()
+        return self.application()
+
+    def row(self, op):
+        p, o = self.prog, op.op
+        name = self.frag_name(op)
+        if is_vertex(o):
+            nl, nr, no = library.VERTICES[VERTEX[o]]
+            ins = {**self.current_inputs("l", op.l, nl), **self.current_inputs("r", op.r, nr)}
+            s = cmul(p.scales[op.t], p.factors[op.x])
+            ins["s.re"], ins["s.im"] = s.real, s.imag
+            if o == Opcode.V_THREE_VECTOR:
+                fu, fv = p.edge_form(op.l), p.edge_form(op.r)
+                for j in range(4):
+                    ins[f"u{j}"], ins[f"v{j}"] = self.form(fu, j), self.form(fv, j)
+                ins["two"] = 2.0
+            if not op.set:
+                ins.update(self.current_inputs("old", op.d, no))
+            self.inline(name, ins, [t for j in range(no) for t in self.edge(op.d, j)])
+        elif is_propagator(o):
+            n = 4 if o == Opcode.P_VECTOR else 2
+            ins = self.current_inputs("c", op.d, n)
+            fd = p.edge_form(op.d)
+            for j in range(4):
+                ins[f"k{j}"] = self.form(fd, j)
+            f = p.factors[op.x]
+            if o == Opcode.P_VECTOR:
+                f = cmul(f, complex(0.0, -1.0))
+            ins["f.re"], ins["f.im"], ins["one"] = f.real, f.imag, 1.0
+            self.inline(name, ins, [t for j in range(n) for t in self.edge(op.d, j)])
+        elif o == Opcode.CLEAR:
+            self.zero([t for j in range(op.n) for t in self.edge(op.d, j)])
+        elif o == Opcode.CLEAR_AMPLITUDE:
+            self.zero(list(self.amp(op.d)))
+        elif o == Opcode.SCALE_ROW:          # c[j] = mul(f, c[j])
+            f = p.factors[op.x]
+            for j in range(op.n):
+                re, im = self.edge(op.d, j)
+                self.cmul_const(re, im, f, a_first=False)
+                self.save(re, 0)
+                self.save(im, 1)
+        elif o == Opcode.COPY:               # out[j] = src[j] × f (0 for a zero factor)
+            f = p.factors[op.x]
+            n = p.edge_layout(op.d).components
+            for j in range(n):
+                dre, dim = self.edge(op.d, j)
+                if f == 0:
+                    self.zero([dre, dim])
+                    continue
+                sre, sim = self.edge(op.l, j)
+                self.cmul_const(sre, sim, f, a_first=True)
+                self.save(dre, 0)
+                self.save(dim, 1)
+        elif o == Opcode.SCATTER:
+            self.scatter(op)
+        elif o == Opcode.CLOSURE:
+            entries = p.lists[op.t]
+            if not entries:
+                return
+            n = len(entries)
+            ins = {**self.current_inputs("l", op.l, n), **self.current_inputs("r", op.r, n)}
+            f = p.factors[op.x]
+            for j, x in enumerate(entries):
+                c = cmul(p.factors[x], f)
+                ins[f"c{j}.re"], ins[f"c{j}.im"] = c.real, c.imag
+            ins["amp.re"], ins["amp.im"] = self.amp(op.d)
+            self.inline(name, ins, list(self.amp(op.d)))
+        elif o == Opcode.SOURCE:
+            self.source(op, name)
+        elif is_kernel(o):
+            self.kernel_row(op, name)
+        elif o == Opcode.REDUCE:
+            # out[d] = out[d] + weight × fma(a.re, a.re, a.im × a.im), a = amplitude × scale
+            (are, aim) = self.amp(op.t)
+            self.load(0, are)
+            self.load(1, aim)
+            if op.x is not None:
+                s = p.factors[op.x]
+                self.cmath("Times", 2, 0, s.real)
+                self.cmath("Times", 3, 1, s.imag)
+                self.bi("Minus", 2, 2, 3)
+                self.cmath("Times", 3, 0, s.imag)
+                self.cmath("Times", 4, 1, s.real)
+                self.bi("Plus", 3, 3, 4)
+            else:
+                self.emit({"Mov": {"dst": G(2), "s1": G(0)}})
+                self.emit({"Mov": {"dst": G(3), "s1": G(1)}})
+            self.bi("Times", 4, 3, 3)
+            self.emit({"Fused": {"op": "MulAdd", "dst": G(4), "a": G(2), "b": G(2), "c": G(4)}})
+            self.cmath("Times", 4, 4, float(p.weights[op.n]))
+            self.load(5, self.out(op.d))
+            self.bi("Plus", 5, 5, 4)
+            self.save(self.out(op.d), 5)
+        else:
+            raise SimdError(f"the opcode {o.name}")
+
+    def scatter(self, op):
+        """out[j] (mode)= scatter_value(src[j], f) with pacops' shortcuts (f is a constant)"""
+        p = self.prog
+        f = p.factors[op.x]
+        n = p.edge_layout(op.d).components
+        for j in range(n):
+            sre, sim = self.edge(op.l, j)
+            dre, dim = self.edge(op.d, j)
+            self.load(4, sre)
+            self.load(5, sim)
+            if f.imag == 0:
+                if f.real == 1:
+                    self.emit({"Mov": {"dst": G(0), "s1": G(4)}})
+                    self.emit({"Mov": {"dst": G(1), "s1": G(5)}})
+                elif f.real == -1:
+                    self.emit({"Uni": {"op": "Neg", "dst": G(0), "s1": G(4)}})
+                    self.emit({"Uni": {"op": "Neg", "dst": G(1), "s1": G(5)}})
+                else:
+                    self.cmath("Times", 0, 4, f.real)
+                    self.cmath("Times", 1, 5, f.real)
+            elif f.real == 0:                # (-v.im × f.im, v.re × f.im)
+                self.emit({"Uni": {"op": "Neg", "dst": G(0), "s1": G(5)}})
+                self.cmath("Times", 0, 0, f.imag)
+                self.cmath("Times", 1, 4, f.imag)
+            else:                            # rmul(v, f)
+                self.cmul_const(sre, sim, f, a_first=True)
+            if not op.set:                   # rcombine: old + value
+                self.load(2, dre)
+                self.load(3, dim)
+                self.bi("Plus", 0, 2, 0)
+                self.bi("Plus", 1, 3, 1)
+            self.save(dre, 0)
+            self.save(dim, 1)
+
+    def source(self, op, name):
+        p = self.prog
+        (family, anti, h, ch) = source_fields(op)
+        mass = p.scales[op.t].real
+        n = {PhysicalType.SCALAR: 1, PhysicalType.WEYL: 2}.get(family, 4)
+        if name is None:                     # a scalar: the wavefunction (1, 0), the products constants
+            wave = [complex(1.0, 0.0)]
+            w = None
+        else:
+            fd = p.edge_form(op.d)
+            ins = {f"k{j}": self.form(fd, j) for j in range(4)}
+            ins.update({"zero": 0.0, "one": 1.0, "two": 2.0, "half": 0.5, "sqh": SQH, "-sqh": -SQH, "mass": mass,
+                        "h": float(h), "-h": float(-h)})
+            for tag, sign in (("+", 1), ("-", -1)):
+                hh = sign * h        # gluon: hel = h for E > 0, -h else; massive vector: -k, -h for E < 0
+                ins.update({f"hel{tag}": float(hh), f"-hel{tag}": -float(hh), f"nsvahl{tag}": float(abs(hh)),
+                            f"-nsvahl{tag}": -float(abs(hh)), f"hel0{tag}": 1.0 - abs(float(hh))})
+                nsf = (-1 if tag == "+" else 1) if anti else (1 if tag == "+" else -1)
+                nh = nsf * h
+                ins.update({f"sf1{tag}": (1 + nsf + (1 - nsf) * nh) * 0.5, f"sf2{tag}": (1 + nsf - (1 - nsf) * nh) * 0.5,
+                            f"nh{tag}": float(nh), f"-nh{tag}": -float(nh)})
+            names = self.frag(name)["inputs"]
+            w = [("scratch", j) for j in range(2 * n)]
+            self.scratch_used = max(self.scratch_used, 2 * n)
+            self.inline(name, {k: ins[k] for k in names}, w)
+            wave = None
+        if op.l is None:                     # out[j] = mul(f, w[j])
+            f = p.factors[op.x]
+            for j in range(n):
+                dre, dim = self.edge(op.d, j)
+                if w is None:
+                    z = cmul(f, wave[j])
+                    self.loadc(0, z.real)
+                    self.loadc(1, z.imag)
+                else:
+                    self.cmul_const(w[2 * j], w[2 * j + 1], f, a_first=False)
+                self.save(dre, 0)
+                self.save(dim, 1)
+        else:                                # embedded: out[components[e]] = mul(factors[e], w[waves[e]]) or 0
+            for (comp, wv, x) in p.embeddings[op.l]:
+                dre, dim = self.edge(op.d, comp)
+                if wv is None:
+                    self.zero([dre, dim])
+                    continue
+                f = p.factors[x]
+                if w is None:
+                    z = cmul(f, wave[wv])
+                    self.loadc(0, z.real)
+                    self.loadc(1, z.imag)
+                else:
+                    self.cmul_const(w[2 * wv], w[2 * wv + 1], f, a_first=False)
+                self.save(dre, 0)
+                self.save(dim, 1)
+
+    def kernel_row(self, op, name):
+        """adapter_<kernel>: the stub's inputs, the kernel, its output pairs (× factor unless direct) into
+        out with the mode"""
+        p, o = self.prog, op.op
+        (s, set_) = p.instances[op.t]
+        stub = p.stubs[s]
+        scaleset = p.scalesets[set_]
+        d = self.frag(name)
+        ins = {}
+        for k, i in enumerate(stub.inputs):
+            im = 1 if i.im else 0
+            if i.kind in (InputKind.IN_L, InputKind.IN_R, InputKind.OUT):
+                e = {InputKind.IN_L: op.l, InputKind.IN_R: op.r, InputKind.OUT: op.d}[i.kind]
+                ins[f"x{k}"] = ("arena", self.b.edge_at(p, e) + 2 * i.n + im)
+            elif i.kind == InputKind.MOMENTUM_U:
+                ins[f"x{k}"] = self.form(p.edge_form(op.l), i.n)
+            elif i.kind == InputKind.MOMENTUM_V:
+                ins[f"x{k}"] = self.form(p.edge_form(op.r), i.n)
+            elif i.kind == InputKind.SCALE:
+                ins[f"x{k}"] = float(p.scales[scaleset[i.n]].real)
+            else:                            # FACTOR
+                z = p.factors[op.x]
+                ins[f"x{k}"] = float(z.imag if im else z.real)
+        pairs = d["outputs"] // 2
+        res = [("scratch", j) for j in range(2 * pairs)]
+        self.scratch_used = max(self.scratch_used, 2 * pairs)
+        self.inline(name, ins, res)
+        f = p.factors[op.x]
+        for n, comp in enumerate(stub.outputs):
+            dre, dim = self.edge(op.d, comp)
+            if o == Opcode.KERNEL_DIRECT:
+                self.load(0, res[2 * n])
+                self.load(1, res[2 * n + 1])
+            else:                            # mul(pair, f)
+                self.cmul_const(res[2 * n], res[2 * n + 1], f, a_first=True)
+            if not op.set:                   # combine: old + value
+                self.load(2, dre)
+                self.load(3, dim)
+                self.bi("Plus", 0, 2, 0)
+                self.bi("Plus", 1, 3, 1)
+            self.save(dre, 0)
+            self.save(dim, 1)
+
+    # ---- the calls ----
+    def finish(self):
+        """the call sites (LoadArgs ultra, Call, the result copies), the bodies after @success, the
+        per-row constant slots filled at the start"""
+        plans = {}
+        for name, sites in self.sites.items():
+            d = self.frag(name)
+            baked, args = {}, []
+            for n in d["inputs"]:
+                vals = {bits(s.inputs[n]) if isinstance(s.inputs[n], float) else None for s in sites}
+                if len(vals) == 1 and None not in vals:
+                    baked[n] = sites[0].inputs[n]
+                else:
+                    args.append(n)
+            args.sort(key=lambda n: isinstance(sites[0].inputs[n], float))   # the operands first (by slot number)
+            if len(args) > ARGS_CAP:
+                raise SimdError(f"{name}: {len(args)} arguments, symjit's subroutines take {ARGS_CAP}")
+            plans[name] = (baked, args)
+            for s in sites:
+                for n in args:
+                    if isinstance(s.inputs[n], float):
+                        self.cslots.setdefault(bits(s.inputs[n]), (len(self.cslots), s.inputs[n]))
+        self.results = max((self.frag(n)["outputs"] for n in self.sites), default=0)
+        code = []
+        for (i, x) in self.cslots.values():
+            code.append({"LoadConst": {"dst": G(0), "idx": self.const(x)}})
+            code.append({"Save": {"loc": self.loc(("cslot", i)), "src": G(0)}})
+        for item in self.code:
+            if not isinstance(item, CallSite):
+                code.append(item)
+                continue
+            baked, args = plans[item.name]
+            locs = [self.loc(("cslot", self.cslots[bits(t)][0]) if isinstance(t, float) else t)
+                    for t in (item.inputs[n] for n in args)]
+            code.append({"LoadArgs": {"locs": locs, "complex": False, "ultra": True}})
+            code.append({"Call": {"label": self.label(item.name) + "_ultra", "num_args": 0}})
+            for j, t in enumerate(item.outputs):
+                code.append({"Load": {"dst": G(0), "loc": self.loc(("result", j))}})
+                code.append({"Save": {"loc": self.loc(t), "src": G(0)}})
+        bodies = []
+        for name in sorted(self.sites):
+            d = self.frag(name)
+            baked, args = plans[name]
+            pos = {n: k for k, n in enumerate(args)}
+            targets = [baked[n] if n in baked else {"Stack": ARG_AREA + pos[n]} for n in d["inputs"]]
+            targets += [self.loc(("result", j)) for j in range(d["outputs"])]
+            label = self.label(name)
+            bodies.append({"Label": {"label": label + "_ultra"}})
+            bodies.append({"SaveArgs": {"num_args": len(args), "complex": False, "ultra": True}})
+            bodies.append({"Label": {"label": label}})
+            bodies.append({"SaveArgs": {"num_args": len(args), "complex": False, "ultra": False}})
+            self._splice(d, targets, check=False, dest=bodies, prefix=label + "_")
+            bodies.append({"Branch": {"label": ".ret"}})
+        self.code = code
+        self.bodies = bodies
+
+    @staticmethod
+    def label(name):
+        return "@f_" + name.replace(":", "_").replace("-", "m")
+
+    def application(self):
+        p = self.prog
+        stack = self.T + self.b.size + self.scratch_used + len(self.cslots) + self.results
+        cfg = library.config()
+        opts = cfg["options"]
+        opts.update({"use_threads": False, "fastmath": False, "compress": bool(self.bodies), "ultra": bool(self.bodies),
+                     "simd_branch": True})
+        tail = ([{"Branch": {"label": "@success"}}] + self.bodies) if self.bodies else []
+        version = library.fragment(library.catalogue()[0])["symjit_version"]
+        return {
+            "format": "symjit-application", "format_version": 1, "symjit_version": version,
+            "program": {"config": cfg, "count_states": 4 * p.legs, "count_params": 0, "count_obs": p.output_count(),
+                        "count_diffs": 0, "count_loops": 0,
+                        "builder": {"consts": self.consts, "count_loops": 0, "count_stack": stack, "ft": []}},
+            "prepared": {"compiled": True, "fast": False, "simd": False},
+            "mir": {"complexified": False, "code": self.code + tail + ["End"], "consts": self.consts, "labels": {}},
+            "reals": [],
+        }
+
+    def stats(self) -> dict:
+        return {"rows": len(self.prog.ops), "instructions": len(self.code) + len(self.bodies),
+                "bodies": len(self.bodies), "calls": sum(len(v) for v in self.sites.values()),
+                "constants": len(self.consts), "stack": self.T + self.b.size + self.scratch_used + len(self.cslots) + self.results}
+
+
+def simd_application(prog: Lowered, call=called) -> tuple[dict, dict]:
+    """the program's kernel as a symjit-application (JSON as a dict), and its sizes"""
+    a = Assembler(prog, call)
+    app = a.assemble()
+    return app, a.stats()
+
+
+# ---- the folder --------------------------------------------------------------------------------------------
+
+def host_lanes() -> tuple[int, ...]:
+    """the lane counts symjit's JIT compiles on this machine: 4 (AVX2 and FMA), and 8 where the CPU has
+    AVX-512 (symjit's use_simd512 asks for avx512f)"""
+    try:
+        flags = set(Path("/proc/cpuinfo").read_text().split())
+    except OSError:
+        flags = set()
+    out = ()
+    if "avx2" in flags and "fma" in flags:
+        out += (4,)
+        if "avx512f" in flags and "avx512dq" in flags:
+            out += (8,)
+    return out
+
+
+def runner_h(prog: Lowered, lanes: Sequence[int]) -> str:
+    have8 = "#define PAC_SIMD_HAVE8 1\n" if 8 in lanes else ""
+    return f"""\
+/* {prog.process} {prog.colour}: the program as SIMD kernels, by PacRunner's compile_simd
+ * (kernel4.h: pac_simd4, AVX2{"; kernel8.h: pac_simd8, AVX-512" if 8 in lanes else ""}; states the momenta, outputs
+ * the helicity outputs). */
+#ifndef RUNNER_H
+#define RUNNER_H
+
+#define RUNNER_PROCESS {cstring(prog.process)}
+#define RUNNER_COLOUR {cstring(prog.colour)}
+#define RUNNER_LEGS {prog.legs}
+#define RUNNER_OUTPUTS {prog.output_count()}
+#define RUNNER_ARENA_SIZE {ArenaIndex.of(prog).size}
+{have8}
+#endif
+"""
+
+
+def compile_simd(path, prog: Lowered, lanes: Optional[Sequence[int]] = None):
+    """the folder of `prog` (see the module); returns `path`. `lanes`: the kernels, 4 and (where this CPU
+    has AVX-512, as symjit compiles it only there) 8; default host_lanes()"""
+    import symjit
+    from ..simd import elf
+    lanes = tuple(host_lanes() if lanes is None else lanes)
+    if 4 not in lanes:
+        raise SimdError("device simd needs an x86-64 CPU with AVX2 and FMA to build on (symjit's JIT compiles the kernels)")
+    path = Path(path)
+    path.mkdir(parents=True, exist_ok=True)
+    app, _ = simd_application(prog)
+    elf.no_relocations(app["mir"]["code"])
+    text = json.dumps(app)
+    (path / "kernel.json").write_text(text)
+    (path / "runner.h").write_text(runner_h(prog, lanes))
+    codes = {}
+    for n in lanes:
+        a = json.loads(text)
+        a["program"]["config"]["options"]["enable_simd512"] = n == 8
+        f = symjit.load_json(json.dumps(a))
+        f.dump(str(path / f"kernel{n}.bin"), "simd")
+        code = (path / f"kernel{n}.bin").read_bytes()
+        (path / f"kernel{n}.bin").unlink()
+        codes[n] = code
+        if n == 8 and code == codes.get(4):   # symjit gave its AVX2 kernel: no AVX-512 here
+            raise SimdError("symjit compiled no AVX-512 kernel on this CPU")
+        symbol = f"pac_simd{n}"
+        (path / f"kernel{n}.o").write_bytes(elf.elf_object(symbol, code))
+        (path / f"kernel{n}.h").write_text(elf.header(symbol, n, a["program"]["count_states"], a["program"]["count_obs"],
+                                                      elf.stack_bytes(a, n), f"{prog.process} {prog.colour}"))
+    return path

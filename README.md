@@ -102,7 +102,23 @@ following operations:
 4. The source files are written to `artifacts/.pacrunner-build/zgg/p0-cpu/programs/0000`.
 5. The source folder is compiled to generate `libumami_pac.so`.
 
-We will discuss the files in the source folder below. For now, let's continue with generating CUDA providers. 
+We will discuss the files in the source folder below.
+
+On x86-64, `compile(device="simd")` builds a faster CPU provider: each program becomes one symjit kernel
+(PacRunner's library of the UIR operations in `pacrunner/simd/`, spliced by `codegen/compile_simd.py`), compiled
+by symjit's JIT into an AVX2 kernel (4 events per call) and, where the building CPU has AVX-512, an AVX-512 kernel
+(8 events per call); PacRunner writes their machine code as object files (`pacrunner/simd/elf.py`: the kernels call
+no functions, so they need no relocations) and links them with the UMAMI layer. The library uses the kernel the CPU it
+runs on supports (`PAC_SIMD_LANES=4` asks for AVX2). Its values are the `cpu` provider's bit for bit; it needs
+nothing beyond symjit and `cc`.
+
+```python
+provider_simd = a.compile(device="simd")    # PacRunner's SIMD provider on the CPU (x86-64)
+rt_simd = provider_simd.runtime(0)
+print(rt_simd(batch, 0).matrix_element)     # should print [2.43239313e-05], as the cpu provider
+```
+
+For now, let's continue with generating CUDA providers. 
 PacRunner currently supports two types of GPU backend: `compile(device="cuda")` and `compile(device="cuda_provider")`
 (also called `device="cuda_full"`: everything on the GPU). 
 
@@ -239,6 +255,8 @@ this process): the colour approximation, not a GPU difference.
 | --- | --- | ---: | ---: | ---: |
 | stock (pyAmpliCol) | f64 | 95.4 | 126.4 | 129.9 |
 | `cpu` | f64 | 44.4 | 48.5 | 58.4 |
+| `simd` (AVX-512) | f64 | 21.4 | — | — |
+| `simd` (AVX2) | f64 | 26.0 | — | — |
 | `gpu` (cuda / metal) | f64 | 28.6 | 11.6 | — |
 | `gpu` (cuda / metal) | mixed | 15.6 | 11.2 | 24.9 |
 | `cuda_full` | f64 | 38.1 | 6.78 | — |
@@ -251,12 +269,17 @@ MadSpace's threads.
 | --- | --- | ---: | ---: | ---: |
 | stock (pyAmpliCol) | f64 | 61.6 | 80.9 | 42.0 |
 | `cpu` | f64 | 23.6 | 23.3 | 15.7 |
+| `simd` (AVX-512) | f64 | 6.50 | — | — |
+| `simd` (AVX2) | f64 | 10.2 | — | — |
 | `gpu` (cuda / metal) | f64 | 15.1 | 0.889 | — |
 | `gpu` (cuda / metal) | mixed | 1.08 | 0.550 | 2.54 |
 | `cuda_full` | f64 | 1.18\* | 0.158\* | — |
 | `cuda_full` | mixed | 0.254\* | 0.091\* | — |
 
 - Wall times: the fastest of 3 untimed runs (RTX 5060, H100); one untimed run after a warm-up (M4).
+- `simd`: one symjit kernel per program, 8 events per call with AVX-512 and 4 with AVX2 (`PAC_SIMD_LANES=4`); the
+  `cpu` provider's bits (the events of the two runs are identical); wall: the fastest of 2 runs, measured beside
+  a fresh `cpu` run (44.7 s, 23.6 µs/pt); x86-64 only, not measured on the H100 yet.
 - `gpu` is CUDA on the RTX 5060 and H100, Metal on the M4 (mixed precision only; no `cuda_full`
   counterpart).
 - Per-point times for `gpu` include threads waiting for the shared GPU. \* `cuda_full`: measured

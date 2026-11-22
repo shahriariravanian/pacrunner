@@ -1,0 +1,37 @@
+{
+ "debug": {
+  "bytecode": false,
+  "instructions": false,
+  "lock": false,
+  "scalar": false,
+  "simd": false,
+  "stats": false,
+  "topology": false
+ },
+ "options": {
+  "compact": true,
+  "complex": false,
+  "compress": false,
+  "coroutines": false,
+  "cse": true,
+  "direct": false,
+  "direct_arena": false,
+  "direct_arena_identity_output": false,
+  "direct_arena_operation": 0,
+  "enable_simd512": false,
+  "fast_complex": true,
+  "fastmath": false,
+  "huge": false,
+  "num_args": 64,
+  "opt_level": 2,
+  "parallel_mul": true,
+  "simd_branch": false,
+  "stable_math": false,
+  "stack_limit": 1048576,
+  "symbolica": false,
+  "ultra": false,
+  "use_simd": true,
+  "use_threads": false
+ },
+ "ty": "native"
+}

@@ -49,7 +49,18 @@
  * momenta, the result) gets a NaN matrix element and leaves its code in an error flag; the next
  * call that sees the flag prints it, clears it and returns UMAMI_ERROR without queuing its own
  * events (umami_free prints one still pending). The alpha_s scale is the device's pow, which may
- * differ from glibc's by an ulp. */
+ * differ from glibc's by an ulp.
+ *
+ * With PAC_SIMD (umami_libraries(...; device = "simd")) the program is one symjit kernel (compile_simd:
+ * kernel4.o, pac_simd4, AVX2; kernel8.o, pac_simd8, AVX-512, when the building CPU has AVX-512 and
+ * runner.h defines PAC_SIMD_HAVE8). An instance takes AVX-512 if the library has it and the CPU too, else
+ * AVX2; PAC_SIMD_LANES=4 or 8 asks for one. A call's
+ * events go to the kernel PAC_SIMD_CHUNK at a time: their momenta as columns (the last chunk padded with
+ * its last event to a multiple of the lanes), the kernel on 4 or 8 events per call, then each event's
+ * end (pac_finish) on its column of outputs. The checks, the scales and the end are the CPU build's, and
+ * the kernel computes runner.c's values: the CPU build's bits. A kernel call uses PAC_SIMD8_STACK_BYTES
+ * (PAC_SIMD4_STACK_BYTES) of the calling thread's stack. The kernels are symjit's JIT code in object files
+ * (compile_simd, simd/elf.py): no relocations, no library calls. */
 #include "umami.h"
 #include "runner.h"
 #include <math.h>
@@ -59,6 +70,18 @@
 #include <string.h>
 #if defined(PAC_CUDA) || defined(PAC_CUDA_PROVIDER)
 #include "uirgpu.h"
+#endif
+#ifdef PAC_SIMD
+#include "kernel4.h"
+#ifdef PAC_SIMD_HAVE8
+#include "kernel8.h"
+#endif
+#ifndef PAC_SIMD_CHUNK
+#define PAC_SIMD_CHUNK 64                      /* events per kernel batch: a multiple of 8 */
+#endif
+#define PAC_SIMD_STATES PAC_SIMD4_COUNT_STATES   /* 4 x the legs: the momenta */
+#define PAC_SIMD_COLUMNS (PAC_SIMD4_COUNT_STATES + PAC_SIMD4_COUNT_OBS)
+typedef int (*pac_simd_kernel)(double *, const symjit_slice *, size_t, const double *);
 #endif
 
 typedef struct {
@@ -75,6 +98,14 @@ typedef struct {
     double *arena;    /* run()'s scratch, RUNNER_ARENA_SIZE (CPU) */
     double momenta[4 * PAC_PARTICLES];
     double values[RUNNER_OUTPUTS];
+#ifdef PAC_SIMD
+    pac_simd_kernel kernel;
+    size_t lanes;
+    double *columns;                           /* PAC_SIMD_COLUMNS columns of PAC_SIMD_CHUNK events */
+    symjit_slice slices[PAC_SIMD_COLUMNS];
+    double scale[PAC_SIMD_CHUNK], random[PAC_SIMD_CHUNK];
+    int scaled[PAC_SIMD_CHUNK], fixed[PAC_SIMD_CHUNK];
+#endif
 #ifdef PAC_CUDA
     size_t capacity;  /* events the scale buffer holds */
     double *scales;   /* the alpha_s scale of each event */
@@ -83,6 +114,70 @@ typedef struct {
     int *error;       /* the error flag (mapped pinned): a failing event's code, until reported */
 #endif
 } Instance;
+
+#ifdef PAC_SIMD
+/* the lanes of this CPU's kernel (8: AVX-512, 4: AVX2), PAC_SIMD_LANES if it asks for one; 0: none */
+static size_t simd_lanes(void) {
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+    __builtin_cpu_init();
+#ifdef PAC_SIMD_HAVE8
+    bool has8 = __builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512dq");
+#else
+    bool has8 = false;   /* built without the AVX-512 kernel */
+#endif
+    bool has4 = __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma");
+    char const *want = getenv("PAC_SIMD_LANES");
+    if (want != NULL && strcmp(want, "4") == 0) return has4 ? 4 : 0;
+    if (want != NULL && strcmp(want, "8") == 0) return has8 ? 8 : 0;
+    return has8 ? 8 : has4 ? 4 : 0;
+#else
+    return 0;
+#endif
+}
+
+static bool simd_setup(Instance *instance) {
+    instance->lanes = simd_lanes();
+    if (instance->lanes == 0) {
+        fprintf(stderr, "umami (%s %s): device simd needs an x86-64 CPU with AVX2 and FMA%s\n", RUNNER_PROCESS,
+                RUNNER_COLOUR, getenv("PAC_SIMD_LANES") ? " (or the kernel PAC_SIMD_LANES asks for: 8 needs AVX-512 "
+                "F and DQ and a library built on such a CPU)" : "");
+        return false;
+    }
+#ifdef PAC_SIMD_HAVE8
+    instance->kernel = instance->lanes == 8 ? pac_simd8 : pac_simd4;
+#else
+    instance->kernel = pac_simd4;
+#endif
+    instance->columns = calloc((size_t)PAC_SIMD_COLUMNS * PAC_SIMD_CHUNK, sizeof(double));
+    if (instance->columns == NULL) return false;
+    for (size_t j = 0; j < PAC_SIMD_COLUMNS; ++j) {
+        instance->slices[j].ptr = instance->columns + j * PAC_SIMD_CHUNK;
+        instance->slices[j].len = PAC_SIMD_CHUNK;
+    }
+    return true;
+}
+
+/* the chunk's n events (the first is `first`): padded to the lanes, the kernel, each event's end */
+static bool simd_flush(Instance *instance, size_t n, size_t first, bool draw, void *const *out) {
+    size_t const lanes = instance->lanes, padded = (n + lanes - 1) / lanes * lanes;
+    for (size_t j = 0; j < PAC_SIMD_STATES; ++j)
+        for (size_t c = n; c < padded; ++c)
+            instance->columns[j * PAC_SIMD_CHUNK + c] = instance->columns[j * PAC_SIMD_CHUNK + n - 1];
+    for (size_t i = 0; i < padded; i += lanes)
+        if (instance->kernel(NULL, instance->slices, i, NULL) != 0) return false;
+    double const *values = instance->columns + (size_t)PAC_SIMD_STATES * PAC_SIMD_CHUNK;
+    for (size_t c = 0; c < n; ++c) {
+        double me;
+        int label;
+        if (pac_finish(values + c, PAC_SIMD_CHUNK, instance->scaled[c], instance->scale[c], instance->fixed[c],
+                       instance->random[c], draw, &me, &label) != 0)
+            return false;
+        if (out[UMAMI_OUT_MATRIX_ELEMENT]) ((double *)out[UMAMI_OUT_MATRIX_ELEMENT])[first + c] = me;
+        if (out[UMAMI_OUT_HELICITY_INDEX]) ((int *)out[UMAMI_OUT_HELICITY_INDEX])[first + c] = label;
+    }
+    return true;
+}
+#endif
 
 #ifdef PAC_CUDA
 /* the instance's scale buffer for `count` events */
@@ -161,6 +256,8 @@ PAC_EXPORT UmamiStatus umami_initialize(UmamiHandle *handle, char const *param_c
 #if defined(PAC_CUDA_PROVIDER)
     instance->error = pac_gpu_error_flag();
     if (instance->error == NULL) { free(instance); return UMAMI_ERROR; }
+#elif defined(PAC_SIMD)
+    if (!simd_setup(instance)) { free(instance->columns); free(instance); return UMAMI_ERROR; }
 #elif !defined(PAC_CUDA)
     instance->arena = calloc(RUNNER_ARENA_SIZE, sizeof(double));
     if (instance->arena == NULL) { free(instance); return UMAMI_ERROR; }
@@ -304,6 +401,20 @@ PAC_EXPORT UmamiStatus umami_matrix_element(UmamiHandle handle, size_t count, si
         /* × 1.0 for an event at alpha_s0 changes no bit: one scale array for the call */
         instance->scales[event - offset] = scale;
         scaled = scaled || event_scaled;
+#elif defined(PAC_SIMD)
+        size_t c = (event - offset) % PAC_SIMD_CHUNK;   /* the event's place in its chunk */
+        for (size_t j = 0; j < n; ++j)
+            for (size_t k = 0; k < 4; ++k) {
+                double value = momenta[event + stride * (n * k + j)];
+                if (!isfinite(value)) return UMAMI_ERROR;
+                instance->columns[(4 * j + k) * PAC_SIMD_CHUNK + c] = value;
+            }
+        instance->scale[c] = scale;
+        instance->scaled[c] = event_scaled;
+        instance->fixed[c] = fixed;
+        instance->random[c] = random;
+        if ((c == PAC_SIMD_CHUNK - 1 || event == offset + count - 1) && !simd_flush(instance, c + 1, event - c, draw, out))
+            return UMAMI_ERROR;
 #else
         for (size_t j = 0; j < n; ++j)
             for (size_t k = 0; k < 4; ++k) {
@@ -344,6 +455,9 @@ PAC_EXPORT UmamiStatus umami_free(UmamiHandle handle) {
 #endif
 #ifdef PAC_CUDA
     free(instance->scales);
+#endif
+#ifdef PAC_SIMD
+    free(instance->columns);
 #endif
     free(instance->arena);
     free(instance);
