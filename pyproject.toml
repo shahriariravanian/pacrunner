@@ -1,6 +1,7 @@
 # pacrunner: pyAmpliCol's recurrence programs as UMAMI libraries, installed from a clone of this
 # repository with `python -m pip install -e .` (editable only: the package finds its C sources, c/,
-# beside it). symjit >= 2.29 comes from conda-forge (binary dependencies), not from PyPI; MadSpace and
+# beside it). symjit >= 2.29 is a requirement: pip keeps a conda-forge symjit that satisfies it, and
+# otherwise installs a PyPI wheel (correct for every Python >= 3.10 from 2.29.1). MadSpace and
 # pyAmpliCol come from a MadGraph7 checkout (pacrunner.configure).
 [build-system]
 requires = ["setuptools>=64"]
@@ -12,7 +13,7 @@ version = "0.3.0"
 description = "pyAmpliCol's LC recurrence programs as UMAMI libraries for MadGraph7/MadSpace (CPU, CUDA), from Python"
 readme = "README.md"
 requires-python = ">=3.10"
-dependencies = ["numpy"]   # and symjit >= 2.29, from conda-forge (binary dependencies): not a pip requirement
+dependencies = ["numpy", "symjit>=2.29"]
 
 [project.optional-dependencies]
 cuda = ["cupy-cuda13x"]

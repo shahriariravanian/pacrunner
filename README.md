@@ -31,10 +31,10 @@ generators and [MadGraph](https://github.com/MadGraphTeam/MadGraph7) ecosystem.
    ```
    with the GPU's architecture (`120`: RTX 50xx, `90`: H100, `80`: A100). `device="cuda"` does not
    need it (the matrix elements on the GPU, MadSpace on the CPU).
-4. Install symjit 2.29 or later, from conda-forge: `conda install -c conda-forge 'symjit>=2.29'`,
-   or from PyPI: `python -m pip install 'symjit>=2.29.1'` (2.29.1 is the first release with wheels
-   for every Python ≥ 3.10 on Linux x86-64 and aarch64, Windows and macOS). symjit is not a pip
-   requirement of PacRunner, so that a conda install is not replaced. PacRunner uses it to read the
+4. Optionally, install symjit 2.29 or later from conda-forge: `conda install -c conda-forge 'symjit>=2.29'`.
+   symjit is a pip requirement of PacRunner (`symjit>=2.29`): step 6 keeps a conda symjit that
+   satisfies it, and otherwise installs symjit from PyPI (2.29.1 and later have wheels for every
+   Python ≥ 3.10 on Linux x86-64 and aarch64, Windows and macOS). PacRunner uses it to read the
    symjit kernels of a program, and checks its version (that of symjit's native library) before it
    builds anything.
 5. Clone PacRunner: `git clone https://github.com/shahriariravanian/pacrunner`, then `cd pacrunner`.
