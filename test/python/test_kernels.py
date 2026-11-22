@@ -1,7 +1,7 @@
 """pacrunner.kernels: the kernels' MIR through symjit's MIR JSON (symjit >= 2.29) and their C.
 
 - the C of every kernel of the golden sets (goldens.py) equals pac-julia's, byte for byte, in full
-  and in mixed precision;
+  and in mixed precision, and so does its MSL (kernel_msl, the Metal runner's; or the refusal);
 - the C, built with cc, gives the bits symjit's own native kernel gives (special inputs and random
   ones; any two NaNs count as the same: the sign of a NaN from 0/0 follows the operand order);
 - julia_repr against Julia's repr (test/data/julia_repr.txt), and the C of hand-made MIR.
@@ -24,7 +24,8 @@ from pathlib import Path
 from goldens import FIXTURE_EXPORTS, ROOT, golden_sets
 
 from pacrunner import kernels, uir
-from pacrunner._literal import julia_repr
+from pacrunner._literal import julia_repr, julia_repr_f32
+from pacrunner.kernels.kernel_c import df64_pair, f32_msl
 
 HAVE_MIR_JSON = kernels.symjit_problem() is None   # symjit >= 2.29 (its native library's version)
 if HAVE_MIR_JSON:
@@ -47,6 +48,13 @@ class Goldens(unittest.TestCase):
                     golden = (folder / "kernels" / f"{sha}{suffix}").read_text()
                     self.assertEqual(f(k.name, mir), golden, f"{name}: {sha}{suffix}")
                     compared += 1
+                msl = folder / "kernels" / f"{sha}.msl"
+                if msl.is_file():
+                    self.assertEqual(kernels.kernel_msl(k.name, mir), msl.read_text(), f"{name}: {sha}.msl")
+                    compared += 1
+                elif (folder / "kernels" / f"{sha}.msl.ERROR").is_file():
+                    with self.assertRaises(kernels.KernelCError, msg=f"{name}: {sha}.msl refused"):
+                        kernels.kernel_msl(k.name, mir)
         self.assertGreater(compared, 0)
 
     def test_header(self):
@@ -112,6 +120,30 @@ class Literals(unittest.TestCase):
             (h, want) = line.split()
             self.assertEqual(julia_repr(_double(h)), want, h)
 
+    def test_julia_repr_f32(self):
+        """Julia's repr of Float32 (test/data/julia_repr_f32.txt), the digits of the MSL literals"""
+        import numpy as np
+        lines = (ROOT / "test" / "data" / "julia_repr_f32.txt").read_text().splitlines()
+        self.assertGreater(len(lines), 20000)
+        for line in lines:
+            (h, want) = line.split()
+            x = np.uint32(int(h, 16)).view(np.float32)
+            if np.isfinite(x):
+                self.assertEqual(julia_repr_f32(x), want, h)
+
+    def test_msl_literals(self):
+        import numpy as np
+        self.assertEqual(f32_msl(0.5), "0.5e0f")
+        self.assertEqual(f32_msl(1e-8), "1.0e-8f")
+        self.assertEqual(f32_msl(-0.0), "-0.0e0f")
+        self.assertEqual(f32_msl(float("inf")), "INFINITY")
+        self.assertEqual(f32_msl(float("-inf")), "(-INFINITY)")
+        self.assertEqual(f32_msl(np.uint32(0x7fc00000).view(np.float32)), "as_type<float>(0x7fc00000u)")
+        hi, lo = df64_pair(0.1)
+        self.assertLess(abs(float(hi) + float(lo) - 0.1), 0.1 * 2.0 ** -46)   # df64: about 48 bits
+        self.assertEqual((float(hi), float(lo)), (float(np.float32(0.1)), float(np.float32(0.1 - float(np.float32(0.1))))))
+        self.assertEqual(df64_pair(1e300), (np.float32(np.inf), np.float32(0.0)))
+
     def test_const_c(self):
         self.assertEqual(kernels.const_c(float("nan")), "sj_double(0x7ff8000000000000ull)")
         self.assertEqual(kernels.const_c(float("inf")), "HUGE_VAL")
@@ -171,6 +203,36 @@ class HandMade(unittest.TestCase):
                     # it compiles (not -Werror: this made-up kernel sets g0 and never reads it)
                     subprocess.run([CC, "-std=c99", "-O2", "-c", "-o",
                                     str(Path(work) / f"{name}.o"), str(src)], check=True)
+
+    def test_msl_kernel(self):
+        """kernel_msl: the funclet inlined (no goto), the division and its divisor df64"""
+        msl = kernels.kernel_msl("k", kernels.parse_mir(_mir_json(REAL)))
+        self.assertTrue(msl.startswith("/* the symjit kernel k in mixed precision (kernel_msl.jl): "), msl)
+        self.assertIn("static inline int k(thread df64 *mem) {", msl)
+        self.assertNotIn("goto", msl)
+        self.assertIn("r0 = dd(2.0e0f, 0.0e0f);", msl)
+        self.assertIn("g1 = dd_f(g0_f) / r0;", msl)
+        self.assertIn("g0_f = fabs(r0_f);", msl)               # the funclet's body, f32
+        self.assertTrue(msl.endswith("return 0;\n}\n"))
+        inlined = kernels.inline_funclets("k", kernels.parse_mir(_mir_json(REAL)).code)
+        # out: the call, the jump over, the funclet (label, 4 instructions, .ret), @over; in: the 4 at the call
+        self.assertEqual(len(inlined), len(REAL) - 9 + 4)
+
+    def test_msl_refusals(self):
+        """straight-line only: a jump, a call of a math function or with arguments, a funclet that
+        branches or does not return"""
+        def refused(code, what):
+            with self.assertRaises(kernels.KernelCError) as e:
+                kernels.kernel_msl("k", kernels.parse_mir(_mir_json(code)))
+            self.assertIn(what, str(e.exception))
+        refused([{"Branch": {"label": "@x"}}, {"Label": {"label": "@x"}}, "End"], "MSL has no goto")
+        refused([{"Call": {"label": "sin", "num_args": 0}}, "End"], "math functions")
+        refused([{"Call": {"label": "@f", "num_args": 1}}, {"Label": {"label": "@f"}}, {"Branch": {"label": ".ret"}}, "End"],
+                "with arguments")
+        refused([{"Call": {"label": "@f", "num_args": 0}}, {"Label": {"label": "@f"}}, "End"], "does not return")
+        refused([{"Call": {"label": "@f", "num_args": 0}}, {"Label": {"label": "@f"}},
+                 {"BranchIf": {"cond": {"Gen": 0}, "label": "@f", "is_else": False}}, {"Branch": {"label": ".ret"}}, "End"],
+                "not straight-line")
 
     def test_refusals(self):
         with self.assertRaises(kernels.KernelCError):
