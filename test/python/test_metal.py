@@ -33,7 +33,7 @@ from pathlib import Path
 
 import numpy as np
 
-from goldens import ROOT, golden_sets
+from goldens import ROOT, golden_sets, same_bits
 
 from pacrunner import codegen, kernels, uir
 cm = importlib.import_module("pacrunner.codegen.compile_metal")   # the module (codegen.compile_metal is the function)
@@ -219,7 +219,7 @@ class Gpu(unittest.TestCase):
                 n = l.output_count()
                 for p in range(len(refs[k][0])):
                     g, s_ = gpu[p * n:(p + 1) * n], shim[p * n:(p + 1) * n]
-                    differ += int(np.any(g.view(np.uint64) != s_.view(np.uint64)))
+                    differ += int(not np.all(same_bits(g, s_)))   # +0 = -0 (goldens.zero_sign_blind)
                     shim_rel = max(shim_rel, float(np.max(np.abs(g - s_))) / abs(float(np.sum(refs[k][1][p]))))
                     points += 1
                 checked += 1

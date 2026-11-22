@@ -3,7 +3,8 @@
 - the C of every kernel of the golden sets (goldens.py) equals pac-julia's, byte for byte, in full
   and in mixed precision, and so does its MSL (kernel_msl, the Metal runner's; or the refusal);
 - the C, built with cc, gives the bits symjit's own native kernel gives (special inputs and random
-  ones; any two NaNs count as the same: the sign of a NaN from 0/0 follows the operand order);
+  ones; any two NaNs count as the same: the sign of a NaN from 0/0 follows the operand order; +0 and
+  -0 too: the C compiler may fold a negated fma, goldens.zero_sign_blind);
 - julia_repr against Julia's repr (test/data/julia_repr.txt), and the C of hand-made MIR.
 
 Skipped without symjit >= 2.29 (symjit.mir_json); the native comparison also without cc.
@@ -21,7 +22,7 @@ import unittest
 from unittest import mock
 from pathlib import Path
 
-from goldens import FIXTURE_EXPORTS, ROOT, golden_sets
+from goldens import FIXTURE_EXPORTS, ROOT, golden_sets, same_bits
 
 from pacrunner import kernels, uir
 from pacrunner._literal import julia_repr, julia_repr_f32
@@ -108,7 +109,7 @@ class Native(unittest.TestCase):
                     mem[:n] = x
                     self.assertEqual(fn(mem.ctypes.data_as(ctypes.POINTER(ctypes.c_double))), 0)
                     got, want = mem[n:n + no], np.asarray(c.obs)
-                    same = (got.view(np.uint64) == want.view(np.uint64)) | (np.isnan(got) & np.isnan(want))
+                    same = same_bits(got, want, nan_equal=True)
                     self.assertTrue(same.all(), f"{k.name}: {x} gives {got}, symjit {want}")
 
 

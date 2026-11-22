@@ -18,6 +18,8 @@ from pathlib import Path
 
 import numpy as np
 
+from goldens import all_same_bits
+
 import pacrunner
 from pacrunner import _pyamplicol
 
@@ -25,9 +27,8 @@ ARTIFACT = os.environ.get("PACRUNNER_TEST_ARTIFACT")
 
 
 def same(a, b):
-    a, b = np.asarray(a), np.asarray(b)
-    return a.shape == b.shape and (np.array_equal(a.view(np.uint64), b.view(np.uint64)) if a.dtype == np.float64
-                                   else np.array_equal(a, b))
+    """bit for bit, +0 and -0 counted equal (goldens.zero_sign_blind)"""
+    return all_same_bits(a, b)
 
 
 def fake_artifact(revision="0" * 40, providers=("p0",)):

@@ -10,6 +10,8 @@ import os
 import struct
 from pathlib import Path
 
+import numpy as np
+
 ROOT = Path(__file__).resolve().parents[2]
 FIXTURE_EXPORTS = ROOT / "test" / "data" / "export"
 FIXTURE_GOLDENS = ROOT / "test" / "data" / "goldens"
@@ -102,3 +104,32 @@ def first_difference(a, b, path="$"):
     if type(a) is not type(b) or a != b:
         return f"{path}: golden {a!r}, ours {b!r}"
     return None
+
+
+# ---- comparing doubles bit for bit
+
+def zero_sign_blind(x) -> np.ndarray:
+    """doubles with -0.0 made +0.0: the tests count +0 and -0 as the same value. C compilers fold
+    `-fma(a, b, c)` into one negated fused instruction (fnmadd, vfnmadd: GCC on x86-64 and aarch64,
+    Apple clang at -O1 and above, whatever the -ffp-model), which gives +0 where -(+0) is -0 when
+    a*b + c is an exact zero; symjit's native code (and the GPU) keep IEEE's sign, so the sign of an
+    exact zero depends on the compiler, nothing else does"""
+    x = np.asarray(x, dtype=np.float64)
+    return np.where(x == 0.0, 0.0, x)
+
+
+def same_bits(a, b, nan_equal: bool = False):
+    """elementwise: the same bits, +0 and -0 counted equal (and any two NaNs, with nan_equal)"""
+    a, b = zero_sign_blind(a), zero_sign_blind(b)
+    same = a.view(np.uint64) == b.view(np.uint64)
+    return same | (np.isnan(a) & np.isnan(b)) if nan_equal else same
+
+
+def all_same_bits(a, b, nan_equal: bool = False) -> bool:
+    a, b = np.asarray(a), np.asarray(b)
+    if a.shape != b.shape:
+        return False
+    if a.dtype != np.float64 or b.dtype != np.float64:
+        return bool(np.array_equal(a, b))
+    return bool(np.all(same_bits(a, b, nan_equal)))
+

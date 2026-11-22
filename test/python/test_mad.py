@@ -22,6 +22,8 @@ from pathlib import Path
 
 import numpy as np
 
+from goldens import all_same_bits
+
 import pacrunner
 from pacrunner import _env, _mad, _mgrun
 
@@ -121,11 +123,8 @@ class OutputRuns(unittest.TestCase):
                 r = rng.random(len(momenta))
                 s = a.runtime(c)(momenta, flavours, random_helicity=r)
                 o = lib.runtime(c, threads=1)(momenta, flavours, random_helicity=r)
-                for name in ("matrix_element", "color_index", "helicity_index"):
-                    self.assertTrue(np.array_equal(getattr(s, name).view(np.uint64) if name == "matrix_element"
-                                                   else getattr(s, name),
-                                                   getattr(o, name).view(np.uint64) if name == "matrix_element"
-                                                   else getattr(o, name)), f"{a.name} channel {c}: {name}")
+                for name in ("matrix_element", "color_index", "helicity_index"):   # +0 = -0 (goldens.zero_sign_blind)
+                    self.assertTrue(all_same_bits(getattr(s, name), getattr(o, name)), f"{a.name} channel {c}: {name}")
 
     def test_the_stock_provider(self):
         for a, lib in zip(self.out.subprocesses(), self.libs):
