@@ -6,10 +6,13 @@ batch by flavour (one DifferentialCrossSection per library of the UMAMI channel)
   python mg7_run.py prepare OUTPUT [--device cpu|cuda] [--precision f64|mixed|...] [--python PYTHON]
       the recurrence export of every SubProcesses/*/lc artifact and, per UMAMI provider, the
       libraries in OUTPUT/lib/pacrunner[-cuda]/<name>_<provider>/umami_pac.json
-  python mg7_run.py run OUTPUT [--device cpu|cuda|cuda_provider|<device>-<precision>] [generate_events arguments, default -f]
+  python mg7_run.py run OUTPUT [--device cpu|cuda|cuda_provider|<device>-<precision>|stock] [generate_events arguments, default -f]
       bin/generate_events with the replaced subprocess class (stock libraries still built: the
       full-colour pass keeps the stock ratio library); PAC_UMAMI_TIMER=LOG times every call of the
-      PacRunner libraries (test/umami_timer.c)
+      PacRunner libraries (test/umami_timer.c). --device stock: MadGraph7's own subprocess class
+      and stock libraries, only (with PAC_UMAMI_TIMER) the stock library and the full-colour ratio
+      library behind the timer, as "stock:<library>" and "ratio:<library>" lines (a wall-clock run
+      should be bin/generate_events itself: the timer costs time on many small calls)
 
 Run with the python of the output (the shebang of OUTPUT/bin/generate_events). The provider
 libraries (prepare --device cuda_provider) run in MadSpace's GPU runtime: run.device = ["cuda"] in
@@ -118,11 +121,27 @@ def timed(path, name):
     log = os.environ.get("PAC_UMAMI_TIMER")
     if not log:
         return path
-    shim = os.path.join(os.path.dirname(path), "libumami_timer.so")
-    subprocess.check_call(["cc", "-O2", "-std=c11", "-fPIC", "-shared", f"-I{os.path.join(PACRUNNER, 'c')}",
+    # one shim per library: the stock libraries share one folder (OUTPUT/lib)
+    shim = os.path.join(os.path.dirname(path), "libumami_timer_" + os.path.basename(path))
+    subprocess.check_call(["cc", "-O2", "-std=c11", "-fPIC", "-shared", f"-I{os.path.join(PACRUNNER, 'pacrunner', 'c')}",
                            f'-DREAL_LIB="{os.path.abspath(path)}"', f'-DLOG_FILE="{os.path.abspath(log)}"',
                            f'-DNAME="{name}"', os.path.join(PACRUNNER, "test", "umami_timer.c"), "-o", shim, "-ldl"])
     return shim
+
+
+def install_stock(output):
+    """MadGraph7's AmplicolSubprocess with its stock libraries, each loaded through the timer shim
+    (PAC_UMAMI_TIMER): the stock library as "stock:<library>", the ratio library as "ratio:<library>"."""
+    import madgraph.mg7.madgraph_process as mp
+    from madgraph.mg7.subprocess_amplicol import AmplicolSubprocess
+
+    class TimedStock(AmplicolSubprocess):
+        def load(self, path, artifact, parameters):
+            kind = "ratio" if path == self.meta.get("ratio_path") else "stock"
+            return super().load(timed(path, f"{kind}:{os.path.basename(path)}"), artifact, parameters)
+
+    if os.environ.get("PAC_UMAMI_TIMER"):
+        mp.AmplicolSubprocess = TimedStock
 
 
 def install(output, device="cpu"):
@@ -224,7 +243,7 @@ def run(output, args, device="cpu"):
         if not os.path.isdir(os.path.join(cuda, "madspace")):
             sys.exit(f"--device {device} needs a CUDA build of MadSpace in {cuda}")
         sys.path.insert(0, cuda)
-    install(output, device)
+    install_stock(output) if device == "stock" else install(output, device)
     from madgraph.mg7.launch import main
     os.chdir(output)
     sys.argv = [os.path.join(output, "bin", "generate_events")] + (args or ["-f"])
