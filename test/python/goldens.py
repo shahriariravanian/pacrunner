@@ -27,6 +27,8 @@ def golden_sets():
         for d in sorted(p for p in base.iterdir() if (p / "manifest.json").is_file()):
             m = json.loads((d / "manifest.json").read_text())
             export = Path(m["export_path"])
+            if not export.is_absolute():                 # recorded relative to the repository
+                export = ROOT / export
             if not export.is_file():                     # a fixture: its export in test/data/export
                 export = FIXTURE_EXPORTS / export.name
             out.append((f"{base.name}/{d.name}", d, export, m))

@@ -253,13 +253,18 @@ function goldens(out::String, path::String, metadata, compile_max::Int)
     end
 
     writejson(joinpath(dir, "manifest.json"),
-              (format = "pacrunner-goldens", format_version = FORMAT_VERSION, export_path = abspath(path),
+              (format = "pacrunner-goldens", format_version = FORMAT_VERSION, export_path = recorded(path),
                export_sha256 = bytes2hex(open(sha256, path)), artifact_id = d["artifact_id"],
-               metadata = metadata === nothing ? nothing : abspath(metadata), pac_julia = pac_julia_revision(),
+               metadata = metadata === nothing ? nothing : recorded(metadata), pac_julia = pac_julia_revision(),
                julia = string(VERSION), written = string(now(UTC)) * "Z", programs = length(ls), kernels = length(kernels),
                compiled = [k - 1 for k in picked], umami_libraries = nlibs))
     println("$name: $(length(ls)) programs, $(length(kernels)) kernels, $(length(picked)) compiled, $nlibs UMAMI libraries")
 end
+
+# a path as the manifest records it: relative to this repository when inside it (the fixtures'
+# exports: no machine's paths in the repository), else absolute
+const REPOSITORY = dirname(dirname(@__DIR__))
+recorded(path) = (p = abspath(path); startswith(p, REPOSITORY * "/") ? relpath(p, REPOSITORY) : p)
 
 # PacRunner's git revision, "+" when its tree has changes
 function pac_julia_revision()
