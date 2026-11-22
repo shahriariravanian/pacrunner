@@ -8,7 +8,12 @@
   (runner.metal, test/metal_shim_run.cpp) at their export's reference points against RustiCol's
   values: the matrix element (the sum of the helicity outputs) within mixed precision's targets
   (c/metal/PLAN.md: median about 2e-7, worst 1e-4), each output relative to it. The programs: the
-  fixtures', and of the corpus the compile_metal sample (all of them with PACRUNNER_TEST_METAL_ALL=1).
+  fixtures', and of the corpus the compile_metal sample (all of them with PACRUNNER_TEST_METAL_ALL=1);
+- on macOS with a Metal GPU (pac-julia's test_metal.jl): each program's folder built (make:
+  librunner_metal.dylib) and run on the GPU (run_metal) at its reference points: the matrix element
+  against RustiCol's values (the shim's targets), and the outputs against the shim's, bit for bit
+  (the GPU's correctly rounded f32 with flush-to-zero, no contraction). The programs: the fixtures',
+  and every program of the exports in PACRUNNER_TEST_METAL_EXPORTS (paths, ":"-separated).
 
 Skipped without symjit >= 2.29 (the kernels' MIR); the shim also without a C++ compiler (CXX, default
 c++).
@@ -19,6 +24,7 @@ c++).
 import ctypes
 import importlib
 import os
+import sys
 import shutil
 import subprocess
 import tempfile
@@ -37,6 +43,42 @@ CXX = os.environ.get("CXX", "c++")
 HAVE_CXX = shutil.which(CXX.split()[0]) is not None
 CXXFLAGS = ["-std=c++17", "-O1", "-ffp-contract=off", "-fPIC", "-shared", "-Wno-attributes", "-Wno-unused-function",
             "-Wno-unused-variable"]
+
+
+def have_metal() -> bool:
+    """macOS with a Metal GPU"""
+    if sys.platform != "darwin":
+        return False
+    r = subprocess.run(["system_profiler", "SPDisplaysDataType"], capture_output=True, text=True)
+    return "Metal" in r.stdout
+
+
+def run_points(fn, l, points, *args) -> np.ndarray:
+    """a runner entry (run_metal or shim_run) on `points`: the outputs, point-major"""
+    n = l.output_count()
+    momenta = np.ascontiguousarray(np.array(points, dtype=np.float64).reshape(-1))
+    out = np.zeros(n * len(points))
+    if args:   # shim_run(program, momenta, points, out)
+        status = fn(ctypes.c_char_p(args[0]), momenta.ctypes.data_as(ctypes.c_void_p), ctypes.c_size_t(len(points)),
+                    out.ctypes.data_as(ctypes.c_void_p))
+    else:      # run_metal(out, momenta, points)
+        status = fn(out.ctypes.data_as(ctypes.c_void_p), momenta.ctypes.data_as(ctypes.c_void_p), ctypes.c_size_t(len(points)))
+    if status != 0:
+        raise RuntimeError(f"{l.process} {l.colour}: status {status}")
+    return out
+
+
+def me_errors(l, out, values):
+    """(the ME errors against RustiCol's values, the worst output error relative to the ME)"""
+    n = l.output_count()
+    errors, worst = [], 0.0
+    for p, ref in enumerate(values):
+        ref = np.asarray(ref, dtype=np.float64)
+        got = out[p * n:(p + 1) * n]
+        me = ref.sum()
+        errors.append(abs(got.sum() - me) / abs(me))
+        worst = max(worst, float(np.max(np.abs(got - ref))) / abs(me))
+    return errors, worst
 
 
 def build_shim(source: Path, out: Path, includes) -> ctypes.CDLL:
@@ -117,22 +159,8 @@ class Shim(unittest.TestCase):
         """the program on the shim at its reference points: (ME errors, worst output error relative to the ME)"""
         codegen.compile_metal(where, l)
         lib = build_shim(ROOT / "test" / "metal_shim_run.cpp", where / "libshim_run.so", [cm.METAL_DIR, where])
-        program = (where / "program.bin").read_bytes()
-        points, values = refs
-        n = l.output_count()
-        momenta = np.ascontiguousarray(np.array(points, dtype=np.float64).reshape(-1))
-        out = np.zeros(n * len(points))
-        status = lib.shim_run(ctypes.c_char_p(program), momenta.ctypes.data_as(ctypes.c_void_p), ctypes.c_size_t(len(points)),
-                              out.ctypes.data_as(ctypes.c_void_p))
-        self.assertEqual(status, 0, f"{l.process} {l.colour}: status {status}")
-        me_errors, out_worst = [], 0.0
-        for p, ref in enumerate(values):
-            ref = np.asarray(ref, dtype=np.float64)
-            got = out[p * n:(p + 1) * n]
-            me = ref.sum()
-            me_errors.append(abs(got.sum() - me) / abs(me))
-            out_worst = max(out_worst, float(np.max(np.abs(got - ref))) / abs(me))
-        return me_errors, out_worst
+        out = run_points(lib.shim_run, l, refs[0], (where / "program.bin").read_bytes())
+        return me_errors(l, out, refs[1])
 
     def test_programs(self):
         every = bool(os.environ.get("PACRUNNER_TEST_METAL_ALL"))
@@ -157,6 +185,51 @@ class Shim(unittest.TestCase):
                           f"outputs (relative to the ME) max {outs:.1e}")
                     self.assertLess(max(me), 1e-4)
                     self.assertLess(float(np.median(me)), 1e-6)
+        self.assertGreater(checked, 0)
+
+
+def gpu_exports():
+    """the fixtures' exports, and PACRUNNER_TEST_METAL_EXPORTS'"""
+    paths = [e for (_, folder, e, _) in golden_sets() if folder.parent.name == "goldens"]
+    paths += [Path(p).expanduser() for p in os.environ.get("PACRUNNER_TEST_METAL_EXPORTS", "").split(":") if p]
+    return paths
+
+
+@unittest.skipUnless(HAVE_MIR_JSON and HAVE_CXX and shutil.which("make") and have_metal(),
+                     "not macOS with a Metal GPU, or no symjit >= 2.29, C++ compiler or make")
+class Gpu(unittest.TestCase):
+    def test_programs(self):
+        checked = 0
+        for export in gpu_exports():
+            ls, refs = uir.load_recurrence_export(export), uir.recurrence_references(export)
+            errors, outs, differ, shim_rel, points = [], 0.0, 0, 0.0, 0
+            for k, l in enumerate(ls):
+                if refs[k] is None:
+                    continue
+                with tempfile.TemporaryDirectory() as where:
+                    where = Path(where)
+                    codegen.compile_metal(where, l)
+                    subprocess.run(["make", "-s", "-C", str(where)], check=True)
+                    gpu = run_points(ctypes.CDLL(str(where / "librunner_metal.dylib")).run_metal, l, refs[k][0])
+                    shim_lib = build_shim(ROOT / "test" / "metal_shim_run.cpp", where / "libshim_run.so", [cm.METAL_DIR, where])
+                    shim = run_points(shim_lib.shim_run, l, refs[k][0], (where / "program.bin").read_bytes())
+                e, o = me_errors(l, gpu, refs[k][1])
+                errors += e
+                outs = max(outs, o)
+                n = l.output_count()
+                for p in range(len(refs[k][0])):
+                    g, s_ = gpu[p * n:(p + 1) * n], shim[p * n:(p + 1) * n]
+                    differ += int(np.any(g.view(np.uint64) != s_.view(np.uint64)))
+                    shim_rel = max(shim_rel, float(np.max(np.abs(g - s_))) / abs(float(np.sum(refs[k][1][p]))))
+                    points += 1
+                checked += 1
+            if errors:
+                with self.subTest(export=str(export)):
+                    print(f"  {export.name}: {points} points: ME error median {np.median(errors):.1e}, max {max(errors):.1e}; "
+                          f"outputs max {outs:.1e}; GPU vs CPU shim: {differ} points differ, max {shim_rel:.1e}")
+                    self.assertLess(max(errors), 1e-4)
+                    self.assertLess(float(np.median(errors)), 1e-6)
+                    self.assertEqual(differ, 0, "the GPU is not the shim's bits")
         self.assertGreater(checked, 0)
 
 
