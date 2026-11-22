@@ -3,7 +3,7 @@ pacrunner/simd/lib/ (one JSON file each) and spliced into a program's kernel by 
 
 A fragment is a symjit function of named inputs (its Mem 0 .. n_in) and outputs (Mem n_in ..), written as
 symjit expression trees (structure.py's format, given to compile_func as they are) in pacops' exact
-order of operations, in real (re, im) pairs, compiled with fastmath off: its bits are pacops.c's
+order of operations, in real (re, im) pairs (C: a pair with operators), compiled with fastmath off: its bits are pacops.c's
 (-ffp-contract=off). Every constant an operation uses (couplings × factors, 0.0, 1.0, 2.0, sqrt(0.5),
 ± the helicity, ...) is an input, so symjit folds nothing; the assembler turns those inputs into
 kernel constants. The trees bypass sympy, which would reorder sums and products and turn a relation on
@@ -77,17 +77,32 @@ def GT(a, b): return node("gt", a, b)
 def GE(a, b): return node("geq", a, b)
 
 
-def cadd(a, b): return (A(a[0], b[0]), A(a[1], b[1]))
-def csub(a, b): return (S(a[0], b[0]), S(a[1], b[1]))
-def cneg(a): return (N(a[0]), N(a[1]))
-def cmul(a, b): return (S(M(a[0], b[0]), M(a[1], b[1])), A(M(a[0], b[1]), M(a[1], b[0])))
-def cmulr(a, x): return (M(a[0], x), M(a[1], x))
-def cmul_i(a): return (N(a[1]), a[0])
+class C(tuple):
+    """a complex value as its (re, im) pair of real trees, with pacops' complex arithmetic in pacops' order:
+      a + b, a - b, -a        componentwise
+      a * b                   (a.re b.re - a.im b.im, a.re b.im + a.im b.re), b a C
+      a * x                   (a.re x, a.im x), x a real tree
+      a.i()                   a × i = (-a.im, a.re)
+    The operators only build trees; Python evaluates a + b - c + d left to right, which is pacops' order."""
+
+    def __new__(cls, re, im):
+        return super().__new__(cls, (re, im))
+
+    def __add__(self, b): return C(A(self[0], b[0]), A(self[1], b[1]))
+    def __sub__(self, b): return C(S(self[0], b[0]), S(self[1], b[1]))
+    def __neg__(self): return C(N(self[0]), N(self[1]))
+
+    def __mul__(self, b):
+        if isinstance(b, C):
+            return C(S(M(self[0], b[0]), M(self[1], b[1])), A(M(self[0], b[1]), M(self[1], b[0])))
+        return C(M(self[0], b), M(self[1], b))
+
+    def i(self): return C(N(self[1]), self[0])
 
 
 def sel(cond, a, b):
-    """cond ? a : b, per component"""
-    return tuple(IF(cond, x, y) for x, y in zip(a, b))
+    """cond ? a : b, per component (a and b: C values)"""
+    return C(IF(cond, a[0], b[0]), IF(cond, a[1], b[1]))
 
 
 def jmax0(x, zero):
@@ -115,7 +130,7 @@ class Frag:
         return {"type": "Var", "name": f"x{len(self.names) - 1}"}
 
     def cplx(self, name):
-        return (self.real(name + ".re"), self.real(name + ".im"))
+        return C(self.real(name + ".re"), self.real(name + ".im"))
 
     def current(self, name, n):
         return [self.cplx(f"{name}{j}") for j in range(n)]
@@ -127,11 +142,8 @@ class Frag:
 # ---- vertices ------------------------------------------------------------------------------------------
 
 def _dot(a, b):
-    return csub(csub(csub(cmul(a[0], b[0]), cmul(a[1], b[1])), cmul(a[2], b[2])), cmul(a[3], b[3]))
-
-
-def _dot_real(a, v):
-    return csub(csub(csub(cmulr(a[0], v[0]), cmulr(a[1], v[1])), cmulr(a[2], v[2])), cmulr(a[3], v[3]))
+    """the Minkowski product a·b (a complex, b complex or real)"""
+    return a[0] * b[0] - a[1] * b[1] - a[2] * b[2] - a[3] * b[3]
 
 
 VERTICES = {   # kind: (l components, r components, out components)
@@ -144,28 +156,28 @@ def _vertex_o(kind, l, r, u, v, two):
     if kind == "weyl_vector_a":
         l0, l1 = l
         r0, r1, r2, r3 = r
-        return [cadd(cadd(csub(cneg(cmul_i(cmul(l0, r3))), cmul_i(cmul(l1, r1))), cmul(l1, r2)), cmul_i(cmul(l0, r0))),
-                cadd(cadd(csub(cneg(cmul(l0, r2)), cmul_i(cmul(l0, r1))), cmul_i(cmul(l1, r0))), cmul_i(cmul(l1, r3)))]
+        return [-(l0 * r3).i() - (l1 * r1).i() + l1 * r2 + (l0 * r0).i(),
+                -(l0 * r2) - (l0 * r1).i() + (l1 * r0).i() + (l1 * r3).i()]
     if kind == "weyl_vector_b":
         l0, l1 = l
         r0, r1, r2, r3 = r
-        return [cadd(cadd(cadd(cneg(cmul(l1, r2)), cmul_i(cmul(l0, r0))), cmul_i(cmul(l0, r3))), cmul_i(cmul(l1, r1))),
-                cadd(cadd(cadd(cneg(cmul_i(cmul(l1, r3))), cmul(l0, r2)), cmul_i(cmul(l0, r1))), cmul_i(cmul(l1, r0)))]
+        return [-(l1 * r2) + (l0 * r0).i() + (l0 * r3).i() + (l1 * r1).i(),
+                -(l1 * r3).i() + l0 * r2 + (l0 * r1).i() + (l1 * r0).i()]
     if kind == "tensor_vector":
         l0, l1, l2, l3, l4, l5 = l
         r0, r1, r2, r3 = r
-        return [cadd(cadd(cmul(l0, r1), cmul(l1, r2)), cmul(l2, r3)),
-                cadd(cadd(cmul(l0, r0), cmul(l3, r2)), cmul(l4, r3)),
-                cadd(csub(cmul(l1, r0), cmul(l3, r1)), cmul(l5, r3)),
-                csub(csub(cmul(l2, r0), cmul(l4, r1)), cmul(l5, r2))]
+        return [l0 * r1 + l1 * r2 + l2 * r3,
+                l0 * r0 + l3 * r2 + l4 * r3,
+                l1 * r0 - l3 * r1 + l5 * r3,
+                l2 * r0 - l4 * r1 - l5 * r2]
     if kind == "vector_wedge":
         l0, l1, l2, l3 = l
         r0, r1, r2, r3 = r
-        return [csub(cmul(l0, r1), cmul(l1, r0)), csub(cmul(l0, r2), cmul(l2, r0)), csub(cmul(l0, r3), cmul(l3, r0)),
-                csub(cmul(l1, r2), cmul(l2, r1)), csub(cmul(l1, r3), cmul(l3, r1)), csub(cmul(l2, r3), cmul(l3, r2))]
+        return [l0 * r1 - l1 * r0, l0 * r2 - l2 * r0, l0 * r3 - l3 * r0,
+                l1 * r2 - l2 * r1, l1 * r3 - l3 * r1, l2 * r3 - l3 * r2]
     if kind == "three_vector":
-        lr, lv, ru = _dot(l, r), _dot_real(l, v), _dot_real(r, u)
-        return [cadd(cmulr(lr, S(u[j], v[j])), cmulr(csub(cmul(lv, r[j]), cmul(ru, l[j])), two)) for j in range(4)]
+        lr, lv, ru = _dot(l, r), _dot(l, v), _dot(r, u)
+        return [lr * S(u[j], v[j]) + (lv * r[j] - ru * l[j]) * two for j in range(4)]
     raise KeyError(kind)
 
 
@@ -180,8 +192,8 @@ def vertex(kind, mode):
     o = _vertex_o(kind, l, r, u, v, two)
     out = []
     for j in range(no):
-        x = cmul(o[j], s)
-        out += list(cadd(old[j], x) if mode == "add" else x)
+        x = o[j] * s
+        out += old[j] + x if mode == "add" else x
     return f, out
 
 
@@ -195,17 +207,17 @@ def propagator(kind):
     fac = f.cplx("f")
     one = f.real("one")
     rn = D(one, S(S(S(M(k[0], k[0]), M(k[1], k[1])), M(k[2], k[2])), M(k[3], k[3])))
-    s = cmulr(fac, rn)
+    s = fac * rn
     if kind == "vector":
-        return f, [x for j in range(4) for x in cmul(c[j], s)]
+        return f, [x for j in range(4) for x in c[j] * s]
     c0, c1 = c
     if kind == "weyl_a":
-        o0 = cadd(cadd(csub(cneg(cmul_i(cmulr(c0, k[3]))), cmul_i(cmulr(c1, k[1]))), cmulr(c1, k[2])), cmul_i(cmulr(c0, k[0])))
-        o1 = cadd(cadd(csub(cneg(cmulr(c0, k[2])), cmul_i(cmulr(c0, k[1]))), cmul_i(cmulr(c1, k[0]))), cmul_i(cmulr(c1, k[3])))
+        o0 = -(c0 * k[3]).i() - (c1 * k[1]).i() + c1 * k[2] + (c0 * k[0]).i()
+        o1 = -(c0 * k[2]) - (c0 * k[1]).i() + (c1 * k[0]).i() + (c1 * k[3]).i()
     else:
-        o0 = cadd(cadd(cadd(cneg(cmulr(c1, k[2])), cmul_i(cmulr(c0, k[0]))), cmul_i(cmulr(c0, k[3]))), cmul_i(cmulr(c1, k[1])))
-        o1 = cadd(cadd(cadd(cneg(cmul_i(cmulr(c1, k[3]))), cmulr(c0, k[2])), cmul_i(cmulr(c0, k[1]))), cmul_i(cmulr(c1, k[0])))
-    return f, [*cmul(o0, s), *cmul(o1, s)]
+        o0 = -(c1 * k[2]) + (c0 * k[0]).i() + (c0 * k[3]).i() + (c1 * k[1]).i()
+        o1 = -(c1 * k[3]).i() + c0 * k[2] + (c0 * k[1]).i() + (c1 * k[0]).i()
+    return f, [*(o0 * s), *(o1 * s)]
 
 
 # ---- closure -------------------------------------------------------------------------------------------
@@ -214,11 +226,10 @@ def closure(n):
     f = Frag()
     l, r = f.current("l", n), f.current("r", n)
     c = [f.cplx(f"c{j}") for j in range(n)]
-    re, im = f.real("amp.re"), f.real("amp.im")
+    amp = f.cplx("amp")
     for j in range(n):
-        t = cmul(cmul(l[j], r[j]), c[j])
-        re, im = A(re, t[0]), A(im, t[1])
-    return f, [re, im]
+        amp = amp + l[j] * r[j] * c[j]
+    return f, list(amp)
 
 
 # ---- wavefunctions (bare) ------------------------------------------------------------------------------
@@ -304,9 +315,9 @@ def wave_dirac_massive(anti, h):
         else:
             up1, lo1, up2, lo2 = M(sf2, omega1), M(sf1, omega2), M(sf2, omega2), M(sf1, omega1)
         if nh > 0:
-            res[pos] = (cmulr(chi1, up1), cmulr(chi2, up1), cmulr(chi1, lo1), cmulr(chi2, lo1))
+            res[pos] = (chi1 * up1, chi2 * up1, chi1 * lo1, chi2 * lo1)
         else:
-            res[pos] = (cmulr(chi2, up2), cmulr(chi1, up2), cmulr(chi2, lo2), cmulr(chi1, lo2))
+            res[pos] = (chi2 * up2, chi1 * up2, chi2 * lo2, chi1 * lo2)
     pos = GT(E, 0)
     return f, [x for j in range(4) for x in sel(pos, res[True][j], res[False][j])]
 
