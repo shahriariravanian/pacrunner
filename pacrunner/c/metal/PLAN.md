@@ -224,3 +224,23 @@ library spends some seconds in each run's survey (p p > z j j 4.9 s, ours 0.0–
 
 - Q1 madmatrix: reviewed (1b). Q2 folders: `c/`, `c/cuda/`, `c/metal/`. Q3 MG7 and MadSpace build on
   macOS. Q4 kernels in Julia. Q5 the event's end on the host first.
+
+## 4c. pacrunner (Python) on the Mac, 2026-11-22
+
+The port of this runner into pacrunner (pac-julia main 15991b1; pacrunner/c/metal/), on the Apple M4
+(10 GPU cores), MadGraph7 2079d93, pacrunner installed not editable, symjit 2.29.1 from PyPI.
+
+- test_metal.py `Gpu`: every program of the fixtures and of three fresh mg7 exports (p p > j j j:
+  1760 points; p p > z j: 48; p p > z j j: 512) on the GPU **bit for bit the CPU shim**; ME error median
+  1.6–2.0e-7, max 1.0e-6. test_artifacts: `compile(device="gpu")` = metal, the stock library to 1e-4.
+- `test/mg7_bench.py` (100k events, 64k batches, LC, MadSpace on 10 threads; wall from `--no-timer`
+  runs, ME thread-seconds from timed ones):
+
+| Process | Mode | σ vs stock | Wall s | ME thread-s |
+|---|---|---|---|---|
+| p p > z j, p p > z j j (168 libraries) | stock | | 27.4 | 139.1 |
+| | cpu | 0 | 5.8 | 11.2 |
+| | metal | −1.7e-7 | 4.7 | 6.1 |
+| p p > j j j (53 libraries) | stock | | 34.3 | 207.6 |
+| | cpu | 0 | 13.6 | 28.5 |
+| | metal | −6.0e-4 (0.9σ: other points sampled) | 12.3 | 15.5 |
