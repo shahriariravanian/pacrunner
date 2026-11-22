@@ -8,17 +8,45 @@ generators and [MadGraph](https://github.com/MadGraphTeam/MadGraph7) ecosystem.
 
 ## Installation
 
-1. Install [MadGraph7](https://github.com/MadGraphTeam/MadGraph7/).
-2. Install `MadGraph7/madspace`. It should be available from Python: `import madspace as ms`.
-3. Install [pyAmpliCol](https://github.com/MadGraphTeam/pyamplicol). It should be on the path.
+1. Clone [MadGraph7](https://github.com/MadGraphTeam/MadGraph7/):
+   `git clone https://github.com/MadGraphTeam/MadGraph7.git`. It needs Python 3.12 or later (use the
+   same python for MadGraph7 and PacRunner), a C++ compiler and cmake 3.15 or later.
+2. Build MadSpace and pyAmpliCol inside the checkout, either from the MadGraph7 prompt
+   (`./bin/madgraph`, then `install madspace` and `install pyamplicol`) or from the checkout's root:
+   ```sh
+   python madspace/install.py --source -y
+   python pyamplicol/install.py --source -y
+   ```
+   Do not pass `--system`: the builds go to `madspace/install` and `pyamplicol/install`, where
+   MadGraph7 and PacRunner look for them. MadGraph7, MadSpace and pyAmpliCol must be of the same
+   revision: rebuild both after pulling MadGraph7.
+3. Optional, for `device="cuda_full"` (MadSpace itself on the GPU): a CUDA build of MadSpace in
+   `madspace/install-cuda`, next to the CPU build of step 2 (whose build dependencies it uses):
+   ```sh
+   cd madspace
+   PYTHONPATH=install python -m pip install --no-build-isolation --upgrade \
+       -Cbuild-dir=build-cuda --target=install-cuda \
+       -Ccmake.define.ENABLE_CUDA=ON -Ccmake.define.CMAKE_CUDA_ARCHITECTURES=120 \
+       -Ccmake.define.ENABLE_OPENBLAS=ON -Ccmake.build-type=Release .
+   ```
+   with the GPU's architecture (`120`: RTX 50xx, `90`: H100, `80`: A100). `device="cuda"` does not
+   need it (the matrix elements on the GPU, MadSpace on the CPU).
 4. Install symjit 2.29 or later from conda-forge: `conda install -c conda-forge 'symjit>=2.29'`.
    symjit is distributed through conda because of its binary dependencies, so it is not a pip
    requirement of PacRunner. PacRunner uses it to read the symjit kernels of a program, and checks
    its version (that of symjit's native library) before it builds anything.
 5. Clone PacRunner: `git clone https://github.com/shahriariravanian/pacrunner`, then `cd pacrunner`.
 6. Install it, editable: `python -m pip install -e .` (the package finds its C sources, `c/`, beside it).
-7. Optional tests: `python -m unittest discover -s test/python` (see [Tests](#tests)).
-8. Set `export NVCC=path/to/nvcc` (optional, should be needed only if CUDA is installed in a non-standard location).
+7. Point PacRunner at the MadGraph7 checkout: `export PACRUNNER_MADGRAPH7=/path/to/MadGraph7`, or
+   `pacrunner.configure(madgraph7="/path/to/MadGraph7")` before the first runtime. PacRunner then
+   imports MadSpace from `madspace/install-cuda` when it exists and from `madspace/install` otherwise
+   (`configure(cuda=False)`: the CPU build), and finds pyAmpliCol in `pyamplicol/install`. Do not put
+   these folders on `PYTHONPATH`: a MadSpace imported before PacRunner chooses its build cannot be
+   switched (`configure` then fails with "MadSpace is already loaded in this process"). Without
+   either setting, PacRunner uses the MadGraph7 an mg7 output was made with, or a `madspace`
+   installed in the python.
+8. Optional tests: `python -m unittest discover -s test/python` (see [Tests](#tests)).
+9. Set `export NVCC=path/to/nvcc` (optional, should be needed only if CUDA is installed in a non-standard location).
 
 You also need a C compiler (`cc`, or `CC`), and `nvcc` for the GPU devices.
   
@@ -173,7 +201,7 @@ seed for each run (`seed = -1`), so the cross section differs from run to run wi
 0.2 pb here); set `seed` in `Cards/run_card.toml` for a reproducible one.
 
 We can do an end-to-end GPU run by passing `device="cuda_full"` (or its alias `"cuda_provider"`),
-assuming Madspace is built for CUDA. MadSpace then runs on the GPU too, which needs the run card's
+assuming Madspace is built for CUDA ([Installation](#installation), step 3). MadSpace then runs on the GPU too, which needs the run card's
 `device = ["cuda"]`, and leading colour (`color_accuracy = "lc"`): the full-colour correction is a CPU
 library. Hence the second output:
 
