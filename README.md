@@ -255,8 +255,8 @@ this process): the colour approximation, not a GPU difference.
 | --- | --- | ---: | ---: | ---: |
 | stock (pyAmpliCol) | f64 | 95.4 | 126.4 | 129.9 |
 | `cpu` | f64 | 44.4 | 48.5 | 58.4 |
-| `simd` (AVX-512) | f64 | 21.4 | — | — |
-| `simd` (AVX2) | f64 | 26.0 | — | — |
+| `simd` (AVX-512) | f64 | 21.4 | 25.0 | — |
+| `simd` (AVX2) | f64 | 26.0 | 26.7 | — |
 | `gpu` (cuda / metal) | f64 | 28.6 | 11.6 | — |
 | `gpu` (cuda / metal) | mixed | 15.6 | 11.2 | 24.9 |
 | `cuda_full` | f64 | 38.1 | 6.78 | — |
@@ -269,8 +269,8 @@ MadSpace's threads.
 | --- | --- | ---: | ---: | ---: |
 | stock (pyAmpliCol) | f64 | 61.6 | 80.9 | 42.0 |
 | `cpu` | f64 | 23.6 | 23.3 | 15.7 |
-| `simd` (AVX-512) | f64 | 6.50 | — | — |
-| `simd` (AVX2) | f64 | 10.2 | — | — |
+| `simd` (AVX-512) | f64 | 6.50 | 10.2 | — |
+| `simd` (AVX2) | f64 | 10.2 | 11.3 | — |
 | `gpu` (cuda / metal) | f64 | 15.1 | 0.889 | — |
 | `gpu` (cuda / metal) | mixed | 1.08 | 0.550 | 2.54 |
 | `cuda_full` | f64 | 1.18\* | 0.158\* | — |
@@ -278,14 +278,41 @@ MadSpace's threads.
 
 - Wall times: the fastest of 3 untimed runs (RTX 5060, H100); one untimed run after a warm-up (M4).
 - `simd`: one symjit kernel per program, 8 events per call with AVX-512 and 4 with AVX2 (`PAC_SIMD_LANES=4`); the
-  `cpu` provider's bits (the events of the two runs are identical); wall: the fastest of 2 runs, measured beside
-  a fresh `cpu` run (44.7 s, 23.6 µs/pt); x86-64 only, not measured on the H100 yet.
+  `cpu` provider's bits (the events of the two runs are identical); x86-64 only. RTX 5060 machine: the fastest
+  of 2 runs, measured beside a fresh `cpu` run (44.7 s, 23.6 µs/pt); H100 machine: from the CPU benchmark below.
 - `gpu` is CUDA on the RTX 5060 and H100, Metal on the M4 (mixed precision only; no `cuda_full`
   counterpart).
 - Per-point times for `gpu` include threads waiting for the shared GPU. \* `cuda_full`: measured
   outside mg7 in synchronized 64k-event batches.
 - MadSpace threads: 24 (RTX 5060, H100), 10 (M4). MadGraph7 2079d93; fixed scales, NNPDF23, seed 7,
   64k batches, leading colour.
+
+**The CPU modes on four processes**: stock, `cpu` and `simd`, wall clock (s, the fastest of 3 runs) and the
+matrix element per point (µs, as above), 100k events, 24 threads; pacrunner 8dd5aeb, MadGraph7 2079d93.
+`simd`'s events are those of `cpu`, bit for bit, in every row.
+
+Ryzen 9 9900X (Zen 5):
+
+| Process | stock | `cpu` | `simd` AVX-512 | `simd` AVX2 | ME stock | ME `cpu` | ME AVX-512 | ME AVX2 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `p p > z j j` | 39.8 | 6.72 | 5.58 | 5.76 | 31.5 | 2.62 | 0.831 | 1.07 |
+| `p p > j j j` | 34.7 | 14.5 | 13.8 | 14.0 | 17.7 | 1.61 | 0.875 | 1.10 |
+| `g g > t t~ g g` (full colour) | 44.1 | 25.5 | 16.2 | 17.4 | 38.1 | 15.6 | 2.95 | 4.34 |
+| `u u~ > z g g g g` | 96.3 | 44.0 | 21.2 | 26.0 | 61.4 | 23.5 | 6.47 | 10.2 |
+
+EPYC 9334 (Zen 4, the H100 machine's 24 vCPUs at 2.0 GHz):
+
+| Process | stock | `cpu` | `simd` AVX-512 | `simd` AVX2 | ME stock | ME `cpu` | ME AVX-512 | ME AVX2 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `p p > z j j` | 47.1 | 6.18 | 4.62 | 4.65 | 32.2 | 2.90 | 0.993 | 1.08 |
+| `p p > j j j` | 35.1 | 8.83 | 7.52 | 7.65 | 18.1 | 1.67 | 0.902 | 0.921 |
+| `g g > t t~ g g` (full colour) | 64.0 | 35.9 | 25.4 | 25.5 | 53.4 | 20.6 | 5.44 | 5.98 |
+| `u u~ > z g g g g` | 124.3 | 48.8 | 25.0 | 26.7 | 79.6 | 24.7 | 10.2 | 11.3 |
+
+- `simd` gains most where the matrix element dominates (`g g > t t~ g g`, `u u~ > z g g g g`: 1.4–2.1× the
+  wall of `cpu`); for the light processes MadSpace's own work is most of the wall.
+- Zen 4 runs 512-bit vectors as two 256-bit halves: AVX2 is within 1–10% of AVX-512 there, against
+  up to 1.6× slower on Zen 5.
 
 ## pyAmpliCol 1.0.x: RustiCol's recurrence export
 
