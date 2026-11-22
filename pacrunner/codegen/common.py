@@ -36,9 +36,9 @@ class CodeWriter:
         self.copy_home("pacops.c", "pacops.h")
 
     def copy_home(self, *names: str) -> None:
-        """files of c/ into the output folder"""
+        """files of c/ (paths within it: "cuda/pool.h") into the output folder, flat"""
         for name in names:
-            shutil.copyfile(C_DIR / name, self.path / name)
+            shutil.copyfile(C_DIR / name, self.path / Path(name).name)
 
     def emit(self, s: str) -> None:
         self.lines.append("\t" * self.indent + s + "\n")
@@ -294,12 +294,12 @@ static const double expected[POINTS][RUNNER_OUTPUTS] = {{
 """ + TESTING_MAIN
 
 
-VM_SOURCES = ("uirvm.c", "uirvm.h", "uirgpu.c", "uirgpu.h", "uirgpu_pool.c", "uirgpu_umami.c", "uirgpu_provider.c", "pool.cu",
-              "pool.h")
+VM_SOURCES = ("uirvm.c", "uirvm.h", "cuda/uirgpu.c", "cuda/uirgpu.h", "cuda/uirgpu_pool.c", "cuda/uirgpu_umami.c",
+              "cuda/uirgpu_provider.c", "cuda/pool.cu", "cuda/pool.h")
 
 
 def makefile(prog: Lowered, testing: bool, interpreter: bool = False) -> str:
-    vm = "".join(" " + f for f in VM_SOURCES) if interpreter else ""
+    vm = "".join(" " + Path(f).name for f in VM_SOURCES) if interpreter else ""   # copied flat
     t = " testing" if testing else ""
     out = (f"# {prog.process} {prog.colour}, compiled by PacRunner's compile.\n"
            f"#   make         runner.o and pacops.o{', and testing' if testing else ''}\n")

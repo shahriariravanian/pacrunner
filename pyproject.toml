@@ -20,8 +20,11 @@ cuda = ["cupy-cuda13x"]
 
 [tool.setuptools]
 # only the Python package and its C sources: the repository root also holds the tests
-# (pacrunner.c: the C sources as data, a package for setuptools only)
-packages = ["pacrunner", "pacrunner.uir", "pacrunner.kernels", "pacrunner.codegen", "pacrunner.c"]
+# (pacrunner.c*: the C sources as data, packages for setuptools only: common, CUDA, Metal)
+packages = ["pacrunner", "pacrunner.uir", "pacrunner.kernels", "pacrunner.codegen", "pacrunner.c", "pacrunner.c.cuda",
+            "pacrunner.c.metal"]
 
 [tool.setuptools.package-data]
 "pacrunner.c" = ["*"]
+"pacrunner.c.cuda" = ["*"]
+"pacrunner.c.metal" = ["*"]

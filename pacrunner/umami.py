@@ -15,7 +15,7 @@ flavor_per_subproc_remap and flavor_subproc_indices as for the stock provider (t
 flavour and subprocess ids). MadSpace splits each batch by flavour itself; a library never sees
 another flavour's events.
 
-device "cuda": the program runs on a CUDA GPU (the UIR interpreter, c/uirgpu.c, built by nvcc); the
+device "cuda": the program runs on a CUDA GPU (the UIR interpreter, c/cuda/uirgpu.c, built by nvcc); the
 library still identifies as a CPU provider (host pointers, MadSpace's CPU threads).
 device "cuda_provider" (alias "cuda_full"): the library identifies as CUDA, for MadSpace's GPU runtime
 (its device pointers and stream; asynchronous, umami_pac.c).
@@ -227,9 +227,9 @@ def build_cuda_runtime(dir, nvcc: Optional[str] = None, cuda_arch: str = "native
     _replace_copy(cudart, copy)
     if not pool:
         return str(copy)
-    shutil.copyfile(C_DIR / "pool.h", dir / "pool.h")
+    shutil.copyfile(C_DIR / "cuda" / "pool.h", dir / "pool.h")
     _run([nvcc, "-O3", f"-arch={cuda_arch}", "-shared", "-Xcompiler", "-fPIC", "-cudart", "shared", "-Xlinker",
-          f"-soname=libpacpool.{SO}", "-Xlinker", "-rpath", "-Xlinker", "$ORIGIN", f"-I{dir}", "-o", so, C_DIR / "pool.cu"])
+          f"-soname=libpacpool.{SO}", "-Xlinker", "-rpath", "-Xlinker", "$ORIGIN", f"-I{dir}", "-o", so, C_DIR / "cuda" / "pool.cu"])
     return str(so)
 
 
