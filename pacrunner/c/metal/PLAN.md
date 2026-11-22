@@ -1,11 +1,13 @@
 # pac-julia on Apple GPUs (Metal)
 
+pac-julia's plan and results (its `c/metal/PLAN.md`, sections 1–6), kept as they were: the file names
+in section 3 are pac-julia's (`src/*.jl`); pacrunner's port and its results on the Mac are section 4c.
+
 Plan 2026-11-14, decisions 2026-11-15, implementation on branch `metal` (2026-11-15). Status:
 **checked on Linux (phases 1–2); on the Mac (M4) the sources compile as MSL and the GPU's f32 and
 df64 operations are the CPU shim's bits (phase 0, 2026-11-15); the programs on the GPU are the
 shim's bits (phase 3), and mg7 runs on them agree with stock and are faster (phase 4,
-2026-11-15); phase 5 (tuning) to do**. The Claude instance on the Mac starts from
-`c/metal/CLAUDE.md`.
+2026-11-15); phase 5 (tuning) to do**.
 
 **Goal.** PacRunner's UIR programs on Apple-silicon GPUs through Metal, as UMAMI libraries MadSpace
 loads on macOS, in one precision mode: CUDA's `mixed` split with every f64 part in df64 (a pair of
@@ -78,7 +80,7 @@ c/metal/  df64.h          the df64 type and operations (MSL and C++)
           uirmetal.{h,m}  the host (Objective-C): compile, pipeline, a call on a pool slot
           metalpool.{h,m} the process-wide slot pool (libpacmetal.dylib)
           umami_metal.c   the UMAMI layer: c/umami_pac.c's CPU library, one GPU run per call
-          PLAN.md, CLAUDE.md
+          PLAN.md
 src/      kernel_c.jl     the mixed kernels' renderers now take a language (:c, :msl); C output unchanged
           kernel_msl.jl   inline_funclets, kernel_msl (a kernel as an MSL function, df64)
           compile_metal.jl  compile_metal(dir, l): runner.metal, program.bin, runner_metal.{c,h}, Makefile
