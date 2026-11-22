@@ -7,7 +7,7 @@ batch by flavour (one DifferentialCrossSection per library of the UMAMI channel)
       the recurrence export of every SubProcesses/*/lc artifact and, per UMAMI provider, the
       libraries in OUTPUT/lib/pacrunner[-<device>]/<name>_<provider>/umami_pac.json (metal: macOS, always
       mixed f32/df64; its libraries are CPU providers, run with run.device = ["cpu"]; simd: x86-64, one
-      symjit kernel per program, needs symjit-utils' sjb2obj with --simd)
+      symjit kernel per program: symjit's AVX2 and AVX-512 kernels as object files)
   python mg7_run.py run OUTPUT [--device cpu|simd|cuda|cuda_provider|metal|<device>-<precision>|stock] [generate_events arguments, default -f]
       bin/generate_events with the replaced subprocess class (stock libraries still built: the
       full-colour pass keeps the stock ratio library); PAC_UMAMI_TIMER=LOG times every call of the

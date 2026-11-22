@@ -1,8 +1,9 @@
 """compile_simd(path, l): a program as one symjit kernel, for device "simd": the program's rows spliced
 from the library of pacops operations (pacrunner/simd/: symjit fragments, pacops.c's bits) into one
-symjit application (symjit's "symjit-application" JSON), saved as .sjb by symjit and compiled by
-symjit-utils' `sjb2obj --simd` into SIMD object kernels: AVX2 (4 points a call) and AVX-512 (8). The
-values are the straight-line C runner's (codegen/compile.py) bit for bit.
+symjit application (symjit's "symjit-application" JSON), compiled by symjit's JIT into its SIMD kernels,
+AVX2 (4 points a call) and AVX-512 (8, where the building CPU has it), whose machine code simd/elf.py wraps
+in object files (no relocations: the kernels call no function). The values are the straight-line C
+runner's (codegen/compile.py) bit for bit.
 
 The kernel: its states are the caller's momenta (E, px, py, pz per leg: Mem 0 .. 4 × legs), its outputs
 the helicity outputs (Mem 4 × legs ..). runner.c's arena (forms, amplitudes, planes: ArenaIndex) is in
@@ -26,7 +27,7 @@ result area of the called fragments. The rows:
     two loads/stores, ComplexBi × and ÷ as kernel_c's fused sequences (through Gen(2), Gen(3), Temp),
     Real/Conjugate/Imaginary/Abs2 as their real meaning; its funclets stay (internal calls).
 
-The folder: kernel.json (the application), kernel.sjb, runner.h (the program's sizes and names, as
+The folder: kernel.json (the application), runner.h (the program's sizes and names, as
 compile.py's), and per lane count L in `lanes` kernel<L>.o and kernel<L>.h (the kernel pac_simd<L>).
 """
 from __future__ import annotations
@@ -34,10 +35,7 @@ from __future__ import annotations
 import copy
 import json
 import math
-import os
-import shutil
 import struct
-import subprocess
 from pathlib import Path
 from typing import Optional, Sequence
 
@@ -738,23 +736,27 @@ def simd_application(prog: Lowered, call=called) -> tuple[dict, dict]:
 
 # ---- the folder --------------------------------------------------------------------------------------------
 
-def find_sjb2obj() -> Optional[str]:
-    """symjit-utils' sjb2obj with --simd: PACRUNNER_SJB2OBJ, else on the PATH"""
-    path = os.environ.get("PACRUNNER_SJB2OBJ") or shutil.which("sjb2obj")
-    if path is None:
-        return None
+def host_lanes() -> tuple[int, ...]:
+    """the lane counts symjit's JIT compiles on this machine: 4 (AVX2 and FMA), and 8 where the CPU has
+    AVX-512 (symjit's use_simd512 asks for avx512f)"""
     try:
-        help_text = subprocess.run([path, "--help"], capture_output=True, text=True, timeout=30).stdout
+        flags = set(Path("/proc/cpuinfo").read_text().split())
     except OSError:
-        return None
-    return path if "--simd" in help_text else None
+        flags = set()
+    out = ()
+    if "avx2" in flags and "fma" in flags:
+        out += (4,)
+        if "avx512f" in flags and "avx512dq" in flags:
+            out += (8,)
+    return out
 
 
-def runner_h(prog: Lowered) -> str:
+def runner_h(prog: Lowered, lanes: Sequence[int]) -> str:
+    have8 = "#define PAC_SIMD_HAVE8 1\n" if 8 in lanes else ""
     return f"""\
 /* {prog.process} {prog.colour}: the program as SIMD kernels, by PacRunner's compile_simd
- * (kernel4.h: pac_simd4, AVX2; kernel8.h: pac_simd8, AVX-512; states the momenta, outputs the helicity
- * outputs). */
+ * (kernel4.h: pac_simd4, AVX2{"; kernel8.h: pac_simd8, AVX-512" if 8 in lanes else ""}; states the momenta, outputs
+ * the helicity outputs). */
 #ifndef RUNNER_H
 #define RUNNER_H
 
@@ -763,30 +765,39 @@ def runner_h(prog: Lowered) -> str:
 #define RUNNER_LEGS {prog.legs}
 #define RUNNER_OUTPUTS {prog.output_count()}
 #define RUNNER_ARENA_SIZE {ArenaIndex.of(prog).size}
-
+{have8}
 #endif
 """
 
 
-def compile_simd(path, prog: Lowered, lanes: Sequence[int] = LANES, sjb2obj: Optional[str] = None,
-                 objects: bool = True):
-    """the folder of `prog` (see the module); returns `path`. `objects` False: kernel.json, kernel.sjb and
-    runner.h only (no sjb2obj)"""
+def compile_simd(path, prog: Lowered, lanes: Optional[Sequence[int]] = None):
+    """the folder of `prog` (see the module); returns `path`. `lanes`: the kernels, 4 and (where this CPU
+    has AVX-512, as symjit compiles it only there) 8; default host_lanes()"""
     import symjit
+    from ..simd import elf
+    lanes = tuple(host_lanes() if lanes is None else lanes)
+    if 4 not in lanes:
+        raise SimdError("device simd needs an x86-64 CPU with AVX2 and FMA to build on (symjit's JIT compiles the kernels)")
     path = Path(path)
     path.mkdir(parents=True, exist_ok=True)
     app, _ = simd_application(prog)
+    elf.no_relocations(app["mir"]["code"])
     text = json.dumps(app)
     (path / "kernel.json").write_text(text)
-    (path / "runner.h").write_text(runner_h(prog))
-    symjit.load_json(text).save(str(path / "kernel.sjb"))
-    if objects:
-        tool = sjb2obj or find_sjb2obj()
-        if tool is None:
-            raise SimdError("device simd needs symjit-utils' sjb2obj with --simd (PACRUNNER_SJB2OBJ, or on the PATH)")
-        for n in lanes:
-            r = subprocess.run([tool, str(path / "kernel.sjb"), "--simd", str(n), "--name", f"pac_simd{n}",
-                                "-o", str(path / f"kernel{n}.o")], capture_output=True, text=True)
-            if r.returncode != 0:
-                raise SimdError(f"sjb2obj --simd {n}: {r.stderr.strip()}")
+    (path / "runner.h").write_text(runner_h(prog, lanes))
+    codes = {}
+    for n in lanes:
+        a = json.loads(text)
+        a["program"]["config"]["options"]["enable_simd512"] = n == 8
+        f = symjit.load_json(json.dumps(a))
+        f.dump(str(path / f"kernel{n}.bin"), "simd")
+        code = (path / f"kernel{n}.bin").read_bytes()
+        (path / f"kernel{n}.bin").unlink()
+        codes[n] = code
+        if n == 8 and code == codes.get(4):   # symjit gave its AVX2 kernel: no AVX-512 here
+            raise SimdError("symjit compiled no AVX-512 kernel on this CPU")
+        symbol = f"pac_simd{n}"
+        (path / f"kernel{n}.o").write_bytes(elf.elf_object(symbol, code))
+        (path / f"kernel{n}.h").write_text(elf.header(symbol, n, a["program"]["count_states"], a["program"]["count_obs"],
+                                                      elf.stack_bytes(a, n), f"{prog.process} {prog.colour}"))
     return path

@@ -52,13 +52,15 @@
  * differ from glibc's by an ulp.
  *
  * With PAC_SIMD (umami_libraries(...; device = "simd")) the program is one symjit kernel (compile_simd:
- * kernel4.o, pac_simd4, AVX2; kernel8.o, pac_simd8, AVX-512; both linked, the CPU picks one when the
- * first instance starts: AVX-512 if it has it, else AVX2; PAC_SIMD_LANES=4 or 8 asks for one). A call's
+ * kernel4.o, pac_simd4, AVX2; kernel8.o, pac_simd8, AVX-512, when the building CPU has AVX-512 and
+ * runner.h defines PAC_SIMD_HAVE8). An instance takes AVX-512 if the library has it and the CPU too, else
+ * AVX2; PAC_SIMD_LANES=4 or 8 asks for one. A call's
  * events go to the kernel PAC_SIMD_CHUNK at a time: their momenta as columns (the last chunk padded with
  * its last event to a multiple of the lanes), the kernel on 4 or 8 events per call, then each event's
  * end (pac_finish) on its column of outputs. The checks, the scales and the end are the CPU build's, and
  * the kernel computes runner.c's values: the CPU build's bits. A kernel call uses PAC_SIMD8_STACK_BYTES
- * (PAC_SIMD4_STACK_BYTES) of the calling thread's stack. */
+ * (PAC_SIMD4_STACK_BYTES) of the calling thread's stack. The kernels are symjit's JIT code in object files
+ * (compile_simd, simd/elf.py): no relocations, no library calls. */
 #include "umami.h"
 #include "runner.h"
 #include <math.h>
@@ -71,7 +73,9 @@
 #endif
 #ifdef PAC_SIMD
 #include "kernel4.h"
+#ifdef PAC_SIMD_HAVE8
 #include "kernel8.h"
+#endif
 #ifndef PAC_SIMD_CHUNK
 #define PAC_SIMD_CHUNK 64                      /* events per kernel batch: a multiple of 8 */
 #endif
@@ -116,7 +120,11 @@ typedef struct {
 static size_t simd_lanes(void) {
 #if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
     __builtin_cpu_init();
+#ifdef PAC_SIMD_HAVE8
     bool has8 = __builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512dq");
+#else
+    bool has8 = false;   /* built without the AVX-512 kernel */
+#endif
     bool has4 = __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma");
     char const *want = getenv("PAC_SIMD_LANES");
     if (want != NULL && strcmp(want, "4") == 0) return has4 ? 4 : 0;
@@ -130,11 +138,16 @@ static size_t simd_lanes(void) {
 static bool simd_setup(Instance *instance) {
     instance->lanes = simd_lanes();
     if (instance->lanes == 0) {
-        fprintf(stderr, "umami (%s %s): device simd needs an x86-64 CPU with AVX2 and FMA (or AVX-512 F and DQ%s)\n",
-                RUNNER_PROCESS, RUNNER_COLOUR, getenv("PAC_SIMD_LANES") ? ", as PAC_SIMD_LANES asks" : "");
+        fprintf(stderr, "umami (%s %s): device simd needs an x86-64 CPU with AVX2 and FMA%s\n", RUNNER_PROCESS,
+                RUNNER_COLOUR, getenv("PAC_SIMD_LANES") ? " (or the kernel PAC_SIMD_LANES asks for: 8 needs AVX-512 "
+                "F and DQ and a library built on such a CPU)" : "");
         return false;
     }
+#ifdef PAC_SIMD_HAVE8
     instance->kernel = instance->lanes == 8 ? pac_simd8 : pac_simd4;
+#else
+    instance->kernel = pac_simd4;
+#endif
     instance->columns = calloc((size_t)PAC_SIMD_COLUMNS * PAC_SIMD_CHUNK, sizeof(double));
     if (instance->columns == NULL) return false;
     for (size_t j = 0; j < PAC_SIMD_COLUMNS; ++j) {
