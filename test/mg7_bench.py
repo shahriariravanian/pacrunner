@@ -9,7 +9,8 @@ stock one too: calls, events, seconds summed over MadSpace's threads). Writes OU
 The timer shims are built and loaded at the run's start (some seconds for many libraries): the whole
 run's wall time is for --no-timer runs, the phases' and the matrix element's for either.
 
-Modes: stock (the output's own library), cpu (PacRunner f64), metal (PacRunner on the Apple GPU);
+Modes: stock (the output's own library), cpu (PacRunner f64), simd (PacRunner's symjit kernels, AVX2 or
+AVX-512, x86-64), metal (PacRunner on the Apple GPU);
 the card is set as for the Linux benchmark: fixed scales, no systematics, no MadNIS, LC colour,
 run.device = ["cpu"]. `mg7_bench.py stock-run OUTPUT` is the stock mode's process (internal).
 """

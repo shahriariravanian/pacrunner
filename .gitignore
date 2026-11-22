@@ -24,6 +24,7 @@ downloads/
 eggs/
 .eggs/
 lib/
+!pacrunner/simd/lib/
 lib64/
 parts/
 sdist/

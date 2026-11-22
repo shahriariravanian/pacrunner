@@ -3,6 +3,7 @@ MadSpace (CPU or CUDA build) and pyAmpliCol. Set with pacrunner.configure(...), 
 environment (PACRUNNER_MADGRAPH7, PACRUNNER_PYAMPLICOL), else found."""
 
 import os
+import platform
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -19,7 +20,7 @@ C_DIR = PACKAGE / "c"
 REPOSITORY = PACKAGE.parent
 
 
-DEVICES = ("cpu", "cuda", "cuda_provider", "metal")
+DEVICES = ("cpu", "simd", "cuda", "cuda_provider", "metal")
 DEVICE_ALIASES = {"cuda_full": "cuda_provider"}   # cuda_full: everything on the GPU (MadSpace's GPU runtime)
 PRECISIONS = ("f64", "mixed")
 
@@ -34,8 +35,8 @@ def device_name(device: str) -> str:
 
 def compile_target(device: str, precision: str = "f64") -> tuple[str, str]:
     """(device, precision) of a build: the device's own name (device_name), and for metal always
-    "mixed" (Metal has no f64: mixed f32/df64); an unknown device or precision, or metal off macOS,
-    is a PacRunnerError"""
+    "mixed" (Metal has no f64: mixed f32/df64); an unknown device or precision, metal off macOS, or simd
+    off x86-64, is a PacRunnerError"""
     name = device_name(device)
     if name not in DEVICES:
         raise PacRunnerError(f"device {device!r}: one of {', '.join(DEVICES)}, or gpu, "
@@ -46,9 +47,16 @@ def compile_target(device: str, precision: str = "f64") -> tuple[str, str]:
         if sys.platform != "darwin":
             raise PacRunnerError(f"device {device!r} is metal (an Apple GPU): macOS only")
         return name, "mixed"
-    if precision != "f64" and name == "cpu":
+    if name == "simd" and not simd_machine():
+        raise PacRunnerError(f"device {device!r}: x86-64 only (AVX2 and AVX-512 kernels; this is {platform.machine()})")
+    if precision != "f64" and name in ("cpu", "simd"):
         raise PacRunnerError(f"precision {precision!r} needs a GPU device (cuda, cuda_provider, metal)")
     return name, precision
+
+
+def simd_machine() -> bool:
+    """whether device "simd" builds here: an x86-64 machine (its kernels are AVX2 and AVX-512 objects)"""
+    return platform.machine().lower() in ("x86_64", "amd64")
 
 
 def c_sources() -> Path:
