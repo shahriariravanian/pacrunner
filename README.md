@@ -9,17 +9,14 @@ generators and [MadGraph](https://github.com/MadGraphTeam/MadGraph7) ecosystem.
 ## Installation
 
 1. Clone [MadGraph7](https://github.com/MadGraphTeam/MadGraph7/):
-   `git clone https://github.com/MadGraphTeam/MadGraph7.git`. It needs Python 3.12 or later (use the
-   same python for MadGraph7 and PacRunner), a C++ compiler and cmake 3.15 or later.
+   `git clone https://github.com/MadGraphTeam/MadGraph7.git`. 
 2. Build MadSpace and pyAmpliCol inside the checkout, either from the MadGraph7 prompt
    (`./bin/madgraph`, then `install madspace` and `install pyamplicol`) or from the checkout's root:
    ```sh
    python madspace/install.py --source -y
    python pyamplicol/install.py --source -y
    ```
-   Do not pass `--system`: the builds go to `madspace/install` and `pyamplicol/install`, where
-   MadGraph7 and PacRunner look for them. MadGraph7, MadSpace and pyAmpliCol must be of the same
-   revision: rebuild both after pulling MadGraph7.
+   Do not pass `--system`: the builds go to `madspace/install` and `pyamplicol/install`.
 3. Optional, for `device="cuda_full"` (MadSpace itself on the GPU): a CUDA build of MadSpace in
    `madspace/install-cuda`, next to the CPU build of step 2 (whose build dependencies it uses):
    ```sh
@@ -29,14 +26,10 @@ generators and [MadGraph](https://github.com/MadGraphTeam/MadGraph7) ecosystem.
        -Ccmake.define.ENABLE_CUDA=ON -Ccmake.define.CMAKE_CUDA_ARCHITECTURES=120 \
        -Ccmake.define.ENABLE_OPENBLAS=ON -Ccmake.build-type=Release .
    ```
-   with the GPU's architecture (`120`: RTX 50xx, `90`: H100, `80`: A100). `device="cuda"` does not
-   need it (the matrix elements on the GPU, MadSpace on the CPU).
+   `device="cuda"` does not need it (the matrix elements on the GPU, MadSpace on the CPU).
 4. Optionally, install symjit 2.29 or later from conda-forge: `conda install -c conda-forge 'symjit>=2.29'`.
    symjit is a pip requirement of PacRunner (`symjit>=2.29`): step 6 keeps a conda symjit that
-   satisfies it, and otherwise installs symjit from PyPI (2.29.1 and later have wheels for every
-   Python ≥ 3.10 on Linux x86-64 and aarch64, Windows and macOS). PacRunner uses it to read the
-   symjit kernels of a program, and checks its version (that of symjit's native library) before it
-   builds anything.
+   satisfies it, and otherwise installs symjit from PyPI.
 5. Clone PacRunner: `git clone https://github.com/shahriariravanian/pacrunner`, then `cd pacrunner`.
 6. Install it, editable: `python -m pip install -e .` (a plain `python -m pip install .` works too: the C
    sources, `pacrunner/c/`, are package data; editable is for working on PacRunner).
@@ -51,8 +44,7 @@ generators and [MadGraph](https://github.com/MadGraphTeam/MadGraph7) ecosystem.
 8. Optional tests: `python -m unittest discover -s test/python` (see [Tests](#tests)).
 9. Set `export NVCC=path/to/nvcc` (optional, should be needed only if CUDA is installed in a non-standard location).
 
-You also need a C compiler (`cc`, or `CC`), and `nvcc` for the CUDA devices (on macOS, the Metal device needs
-only the Command Line Tools: `cc` with Objective-C and the Metal framework).
+You also need a C compiler (`cc`, or `CC`), and `nvcc` for the GPU devices.
   
 ## Quick Start
 
