@@ -51,7 +51,8 @@ generators and [MadGraph](https://github.com/MadGraphTeam/MadGraph7) ecosystem.
 8. Optional tests: `python -m unittest discover -s test/python` (see [Tests](#tests)).
 9. Set `export NVCC=path/to/nvcc` (optional, should be needed only if CUDA is installed in a non-standard location).
 
-You also need a C compiler (`cc`, or `CC`), and `nvcc` for the GPU devices.
+You also need a C compiler (`cc`, or `CC`), and `nvcc` for the CUDA devices (on macOS, the Metal device needs
+only the Command Line Tools: `cc` with Objective-C and the Metal framework).
   
 ## Quick Start
 
@@ -114,7 +115,14 @@ PacRunner currently supports two types of GPU backend: `compile(device="cuda")` 
 (also called `device="cuda_full"`: everything on the GPU). 
 
 The first one is a hybrid provider, where the UMAMI library identifies itself as a "CPU" provider but actually runs CUDA 
-kernels. The second one is a full CUDA provider that identifies itself as "CUDA". First, the `cuda` option:
+kernels. The second one is a full CUDA provider that identifies itself as "CUDA".
+
+On macOS, `compile(device="metal")` builds the same kind of hybrid provider for an Apple GPU through
+Metal; it always computes in mixed precision (f32 and double-f32), since Metal has no f64. For code
+that runs on both, `compile(device="gpu")` picks `metal` on macOS and `cuda` elsewhere
+(`pacrunner/c/metal/CLAUDE.md` and `PLAN.md`: the Metal runner, its tests and results).
+
+First, the `cuda` option:
 
 ```python
 import pacrunner
