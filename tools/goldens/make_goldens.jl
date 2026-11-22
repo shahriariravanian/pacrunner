@@ -14,19 +14,24 @@
 #                        unchanged by it: checked), and the 8-byte encodings of both ("encoded",
 #                        "encoded_optimized")
 #   kernels/<sha>.c      kernel_c of each kernel (named as compile names it: k_ and the first 16 hex
-#                        digits of its SHA-256), <sha>.mixed.c kernel_c_mixed
+#                        digits of its SHA-256), <sha>.mixed.c kernel_c_mixed, <sha>.msl kernel_msl
+#                        (the Metal runner's; <sha>.msl.ERROR when it refuses the kernel)
 #   compile/NNNN/<variant>/
 #                        the files compile writes (runner.c, runner.h, Makefile, and testing.c on the
 #                        export's reference points), not the copies of c/; variants: imported and
 #                        optimized, each straight-line and interpreter (an ERROR file when compile refuses)
 #                        for a sample of the programs (--compile-max, default 12, plus the first two
 #                        with kernel rows and the first two members of a process group)
+#   compile_metal/NNNN/<variant>/
+#                        the files compile_metal writes (runner.metal, program.bin, runner_metal.c,
+#                        runner_metal.h, Makefile), not the copies of c/metal/; variants imported and
+#                        optimized; the same sample (an ERROR file when compile_metal refuses)
 #   umami/libraries.json, umami/NNNN/<variant>/
 #                        with METADATA (the artifact's API/umami/metadata.json): every library
 #                        umami_libraries would build (its program optimized, its leg permutation folded
 #                        into the crossing): the compiled files of both variants (straight-line: the CPU
-#                        build; interpreter: the CUDA builds) and umami_tables.h, umami_program.h; nothing
-#                        is built
+#                        build; interpreter: the CUDA builds), compile_metal's files (metal: the Metal
+#                        build) and umami_tables.h, umami_program.h; nothing is built
 #
 # The JSON follows the Python port's conventions, not Julia's: every index is 0-based and an absent
 # one is null (Julia's 0); every double is its bit pattern, "0x" and 16 hex digits (as symjit's MIR
@@ -40,7 +45,7 @@ using SHA
 using Dates
 
 const P = PacRunner
-const FORMAT_VERSION = 1
+const FORMAT_VERSION = 2   # 2: the Metal runner (kernels/*.msl, compile_metal/, umami/NNNN/metal/)
 
 # ---- values ----------------------------------------------------------------------------------------
 
@@ -138,6 +143,21 @@ function compiled!(dir, l; interpreter::Bool, examples = nothing)
     end
 end
 
+const GENERATED_METAL = ("runner.metal", "program.bin", "runner_metal.c", "runner_metal.h", "Makefile")
+
+# compile_metal's generated files for `l` into `dir` (not the copies of c/metal/), or an ERROR file
+function compiled_metal!(dir, l)
+    mkpath(dir)
+    try
+        mktempdir() do tmp
+            compile_metal(tmp, l)
+            foreach(f -> cp(joinpath(tmp, f), joinpath(dir, f); force = true), GENERATED_METAL)
+        end
+    catch err
+        write(joinpath(dir, "ERROR"), sprint(showerror, err))
+    end
+end
+
 function compile_variants!(dir, l, o; examples = nothing)
     for (name, prog) in (("imported", l), ("optimized", o)), interpreter in (false, true)
         compiled!(joinpath(dir, "$name-$(interpreter ? "interpreter" : "straight")"), prog; interpreter, examples)
@@ -185,6 +205,11 @@ function goldens(out::String, path::String, metadata, compile_max::Int)
         mkpath(joinpath(dir, "kernels"))
         write(joinpath(dir, "kernels", "$sha.c"), P.kernel_c(k.name, k.source))
         write(joinpath(dir, "kernels", "$sha.mixed.c"), P.kernel_c_mixed(k.name, k.source))
+        try
+            write(joinpath(dir, "kernels", "$sha.msl"), P.kernel_msl(k.name, k.source))
+        catch err
+            write(joinpath(dir, "kernels", "$sha.msl.ERROR"), sprint(showerror, err))
+        end
     end
 
     # compile: a sample, with the first programs that have kernel rows and the first members
@@ -193,6 +218,9 @@ function goldens(out::String, path::String, metadata, compile_max::Int)
     picked = sample(length(ls), compile_max, vcat(with_kernels, members))
     for k in picked
         compile_variants!(joinpath(dir, "compile", pad(k)), ls[k], optimized(ls[k]); examples = examples_of(ls[k], refs[k]))
+        for (variant, prog) in (("imported", ls[k]), ("optimized", optimized(ls[k])))
+            compiled_metal!(joinpath(dir, "compile_metal", pad(k), variant), prog)
+        end
     end
 
     # the UMAMI libraries umami_libraries would build (nothing built)
@@ -211,6 +239,7 @@ function goldens(out::String, path::String, metadata, compile_max::Int)
             for interpreter in (false, true)
                 compiled!(joinpath(ldir, interpreter ? "interpreter" : "straight"), l; interpreter)
             end
+            compiled_metal!(joinpath(ldir, "metal"), l)
             (tables, program) = P.umami_program_h(lib, l, provider, exported_count, parameters)
             write(joinpath(ldir, "umami_tables.h"), tables)
             write(joinpath(ldir, "umami_program.h"), program)

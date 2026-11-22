@@ -17,13 +17,14 @@ project is a pac-julia checkout; `manifest.json` records its revision.
 
 | Path | What |
 |---|---|
-| `manifest.json` | `format` "pacrunner-goldens", `format_version` 1, `export_path`, `export_sha256`, `artifact_id`, `metadata`, `pac_julia` (revision, `+` when its tree had changes), `julia`, `written`, the counts, `compiled` (the entries compiled) |
+| `manifest.json` | `format` "pacrunner-goldens", `format_version` 2 (2: the Metal runner's files), `export_path`, `export_sha256`, `artifact_id`, `metadata`, `pac_julia` (revision, `+` when its tree had changes), `julia`, `written`, the counts, `compiled` (the entries compiled) |
 | `programs.json` | per program entry, in the export's order: `index`, `process`, `colour`, `member` (a process-group member or alias), `kernel_rows`, `references` |
 | `lowered/NNNN.json` | entry NNNN: `lowered` (as `load_recurrence_export` makes it), `optimized_ops` (the rows after `optimize`; the tables are unchanged by it, which the script checks), `encoded` and `encoded_optimized` (`version`, `rows` as 64-bit hex words with the END word last, `edges` as 32-bit integers; or `error`) |
-| `kernels/<sha256>.c`, `<sha256>.mixed.c` | `kernel_c` and `kernel_c_mixed` of each kernel, named as `compile` names it (`k_` and the first 16 hex digits) |
+| `kernels/<sha256>.c`, `<sha256>.mixed.c`, `<sha256>.msl` | `kernel_c`, `kernel_c_mixed` and `kernel_msl` (the Metal runner's; `<sha256>.msl.ERROR` when it refuses the kernel) of each kernel, named as `compile` names it (`k_` and the first 16 hex digits) |
 | `compile/NNNN/<variant>/` | the files `compile` writes (`runner.c`, `runner.h`, `Makefile`, `testing.c` on the export's reference points), without the copies of `c/`; variants `imported-straight`, `imported-interpreter`, `optimized-straight`, `optimized-interpreter`; an `ERROR` file when `compile` refuses. For a sample of the entries (`--compile-max`, default 12, evenly spaced, plus the first two with kernel rows and the first two members) |
+| `compile_metal/NNNN/<variant>/` | the files `compile_metal` writes (`runner.metal`, `program.bin`, `runner_metal.c`, `runner_metal.h`, `Makefile`), without the copies of `c/metal/`; variants `imported`, `optimized`; the same sample as `compile/`; an `ERROR` file when `compile_metal` refuses |
 | `umami/libraries.json` | the libraries `umami_libraries` would build (`index`, `process`, `colour`, `permutation`, `colour_index`, `factor`, `helicity_export`) and per channel `flavor_libraries`, `libraries` |
-| `umami/NNNN/{straight,interpreter}/`, `umami_tables.h`, `umami_program.h` | per library: its program optimized, its permutation folded into the crossing, compiled (straight-line: the CPU build; interpreter: the CUDA builds), and the UMAMI headers. Nothing is built |
+| `umami/NNNN/{straight,interpreter}/`, `umami_tables.h`, `umami_program.h` | per library: its program optimized, its permutation folded into the crossing, compiled (straight-line: the CPU build; interpreter: the CUDA builds; `metal/`: compile_metal's files, the Metal build), and the UMAMI headers. Nothing is built |
 
 ## Conventions (the Python port's, not Julia's)
 
