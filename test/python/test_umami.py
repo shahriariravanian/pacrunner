@@ -1,7 +1,7 @@
 """pacrunner.umami against the UMAMI goldens (tools/goldens: pac-julia's umami_libraries, nothing built):
 for every golden set with an artifact's metadata, the provider's libraries and channels
 (libraries.json), and per library its umami_tables.h, umami_program.h and compiled folders
-(straight-line and interpreter), byte for byte; and one provider built on the CPU (cc).
+(straight-line, interpreter and compile_metal's), byte for byte; and one provider built on the CPU (cc).
 
 The golden sets with metadata are the corpus's (PACRUNNER_GOLDENS, else ~/symjit-data/pacrunner-goldens):
 skipped without them, or without symjit >= 2.29.
@@ -61,6 +61,12 @@ class Goldens(unittest.TestCase):
                             for f in ("runner.c", "runner.h", "Makefile"):
                                 self.assertEqual((Path(out) / f).read_bytes(), (g / variant / f).read_bytes(),
                                                  f"library {k} {variant} {f}")
+                    if (g / "metal").is_dir():   # the Metal build's generated files
+                        with tempfile.TemporaryDirectory() as out:
+                            codegen.compile_metal(out, l)
+                            for f in ("runner.metal", "program.bin", "runner_metal.c", "runner_metal.h", "Makefile"):
+                                self.assertEqual((Path(out) / f).read_bytes(), (g / "metal" / f).read_bytes(),
+                                                 f"library {k} metal {f}")
 
     @unittest.skipUnless(shutil.which("cc"), "no cc")
     def test_cpu_build(self):
@@ -142,6 +148,15 @@ class Units(unittest.TestCase):
             umami.build_umami_library("/nonexistent", None, None, {}, 1, [], device="tpu")
         with self.assertRaises(umami.UmamiError):
             umami.build_umami_library("/nonexistent", None, None, {}, 1, [], precision="mixed")
+        # gpu: this system's GPU; metal builds on macOS only, before any work
+        with mock.patch.object(umami._env.sys, "platform", "linux"):
+            self.assertEqual(umami.device_name("gpu"), "cuda")
+            with self.assertRaisesRegex(umami.UmamiError, "macOS only"):
+                umami.build_umami_library("/nonexistent", None, None, {}, 1, [], device="metal")
+            with self.assertRaisesRegex(umami.UmamiError, "macOS only"):
+                umami.build_metal_runtime("/nonexistent")
+        with mock.patch.object(umami._env.sys, "platform", "darwin"):
+            self.assertEqual(umami.device_name("gpu"), "metal")
 
 
 if __name__ == "__main__":

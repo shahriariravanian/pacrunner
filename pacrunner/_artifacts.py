@@ -223,21 +223,23 @@ class Artifact:
 
     def default_folder(self, device="cpu", precision="f64"):
         """where compile puts the libraries by default: <parent>/.pacrunner-build/<artifact>/<provider>-<device>[-<precision>]"""
-        name = f"{self.provider}-{_env.device_name(device)}" + ("" if precision == "f64" else f"-{precision}")
+        device, precision = _env.compile_target(device, precision)
+        name = f"{self.provider}-{device}" + ("" if precision == "f64" else f"-{precision}")
         return self.path.parent / ".pacrunner-build" / self.path.name / name
 
     def compile(self, folder=None, device="cpu", precision="f64", parameters=None, interpreter=False, force=False):
         """PacRunner's UMAMI libraries of this provider: the export (export()), then umami_libraries
         (pacrunner.umami) into `folder` (default: default_folder()); returns the Provider. Skipped when
         `folder` holds libraries of the same artifact, provider, parameters, device, precision, pacrunner
-        revision and symjit (its pacrunner-build.json), unless `force`. device: "cpu", "cuda" (the GPU, a CPU
-        provider), "cuda_provider" or its alias "cuda_full" (MadSpace's GPU runtime); precision "f64" or
-        "mixed" (the GPU)."""
+        revision and symjit (its pacrunner-build.json), unless `force`. device: "cpu", "cuda" (an NVIDIA GPU, a
+        CPU provider), "metal" (an Apple GPU, a CPU provider, macOS; always mixed f32/df64), "gpu" (this
+        system's: metal on macOS, cuda elsewhere), "cuda_provider" or its alias "cuda_full" (MadSpace's GPU
+        runtime); precision "f64" or "mixed" (a GPU device)."""
         from .kernels import require_symjit, symjit_fingerprint
         from .umami import umami_libraries
         require_symjit()   # symjit >= 2.29, before the export
         _env.c_sources()   # and the C sources
-        device = _env.device_name(device)
+        device, precision = _env.compile_target(device, precision)
         from ._libraries import Provider
         folder = Path(folder) if folder is not None else self.default_folder(device, precision)
         stamp = {"artifact_id": self.id, "provider": self.provider, "device": device, "precision": precision,

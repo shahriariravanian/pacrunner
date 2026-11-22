@@ -19,6 +19,10 @@ device "cuda": the program runs on a CUDA GPU (the UIR interpreter, c/cuda/uirgp
 library still identifies as a CPU provider (host pointers, MadSpace's CPU threads).
 device "cuda_provider" (alias "cuda_full"): the library identifies as CUDA, for MadSpace's GPU runtime
 (its device pointers and stream; asynchronous, umami_pac.c).
+device "metal" (macOS): the program runs on an Apple GPU (the UIR interpreter in MSL, c/metal/, mixed
+f32/df64: Metal has no f64), the library a CPU provider (c/metal/umami_metal.c: the inputs and each
+event's end on the host in f64, one GPU run per call); one slot pool per process, libpacmetal.dylib.
+device "gpu": this system's GPU with MadSpace on the CPU, metal on macOS and cuda elsewhere.
 
 The programs come from RustiCol's recurrence export (uir.load_recurrence_export) of the same artifact,
 with the same model parameters: a library refuses other values (umami_set_parameter).
@@ -40,15 +44,17 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Sequence, Union
 
-from . import codegen, kernels, uir
+from . import _env, codegen, kernels, uir
 from ._literal import julia_repr
 from .codegen.common import C_DIR, cstring
 from .codegen.compile_vm import GPU_MEMORY_DEFAULT
 from .uir import Lowered
 
-DEVICES = ("cpu", "cuda", "cuda_provider")   # cuda: on the GPU, a CPU provider; cuda_provider: a CUDA one
-DEVICE_ALIASES = {"cuda_full": "cuda_provider"}   # cuda_full: all on the GPU (MadSpace's GPU runtime)
-PRECISIONS = ("f64", "mixed")                 # a CUDA device: mixed is pacops.h's PAC_MIXED
+DEVICES = _env.DEVICES                        # cuda: on the GPU, a CPU provider; cuda_provider: a CUDA one;
+                                              # metal: an Apple GPU, a CPU provider, always mixed
+DEVICE_ALIASES = _env.DEVICE_ALIASES          # cuda_full: all on the GPU (MadSpace's GPU runtime)
+PRECISIONS = _env.PRECISIONS                  # a CUDA device: mixed is pacops.h's PAC_MIXED
+GPU_DEVICES = ("cuda", "cuda_provider", "metal")
 SO = "dylib" if sys.platform == "darwin" else "so"
 
 Flags = Union[str, Sequence[str]]
@@ -59,7 +65,8 @@ class UmamiError(RuntimeError):
 
 
 def device_name(device: str) -> str:
-    return DEVICE_ALIASES.get(device, device)
+    """a device's own name (an alias's target; gpu: metal on macOS, cuda elsewhere)"""
+    return _env.device_name(device)
 
 
 @dataclass(frozen=True)
@@ -233,6 +240,57 @@ def build_cuda_runtime(dir, nvcc: Optional[str] = None, cuda_arch: str = "native
     return str(so)
 
 
+METAL_POOL = ("metalpool.h", "metalpool.m")
+METAL_FRAMEWORKS = ["-framework", "Metal", "-framework", "Foundation"]
+
+
+def _require_macos(device: str = "metal") -> None:
+    if sys.platform != "darwin":
+        raise UmamiError(f"device = {device} builds on macOS only (Metal)")
+
+
+def build_metal_runtime(dir, cc: Optional[str] = None) -> str:
+    """the process-wide Metal slot pool (c/metal/metalpool.m) in `dir`: libpacmetal.dylib (macOS), which
+    every program library links (rpath @loader_path)"""
+    _require_macos()
+    dir = Path(dir)
+    for f in METAL_POOL:
+        shutil.copyfile(C_DIR / "metal" / f, dir / f)
+    so = dir / "libpacmetal.dylib"
+    _run([*_flags(cc or find_cc() or "cc"), "-O2", "-fPIC", "-fobjc-arc", "-dynamiclib", "-install_name",
+          "@rpath/libpacmetal.dylib", "-o", so, dir / "metalpool.m", *METAL_FRAMEWORKS])
+    return str(so)
+
+
+def build_umami_metal(dir, lib: UmamiLibrary, l: Lowered, provider: dict, exported_count: int, parameters, *,
+                      cc: Optional[str] = None, cflags: Flags = ("-O2",), runtime_dir=None) -> str:
+    """build_umami_library for device "metal" (macOS): compile_metal's folder (the permutation folded into
+    the crossing), the UMAMI layer c/metal/umami_metal.c, linked against libpacmetal.dylib in
+    `runtime_dir` (built there if missing); every symbol but the UMAMI functions hidden"""
+    _require_macos()
+    if int(provider["particle_count"]) != l.legs:
+        raise UmamiError(f"{lib.process} {lib.colour}: the provider has {provider['particle_count']} particles, "
+                         f"the program {l.legs} legs")
+    dir = Path(dir)
+    runtime_dir = Path(runtime_dir) if runtime_dir is not None else dir
+    l = permuted(l, lib.permutation)   # the library reads the caller's legs
+    codegen.compile_metal(dir, l)
+    (tables, program) = umami_program_h(lib, l, provider, exported_count, parameters)
+    (dir / "umami_tables.h").write_text(tables, encoding="utf-8")
+    (dir / "umami_program.h").write_text(program, encoding="utf-8")
+    shutil.copyfile(C_DIR / "metal" / "umami_metal.c", dir / "umami_metal.c")
+    for f in ("umami_finish.h", "umami.h"):
+        shutil.copyfile(C_DIR / f, dir / f)
+    if not (runtime_dir / "libpacmetal.dylib").is_file():
+        build_metal_runtime(runtime_dir, cc)
+    so = dir / "libumami_pac.dylib"
+    rpath = "@loader_path/" + os.path.relpath(runtime_dir.resolve(), dir.resolve())
+    _run([*_flags(cc or find_cc() or "cc"), *_flags(cflags), "-ffp-contract=off", "-fPIC", "-fvisibility=hidden", "-fobjc-arc",
+          "-dynamiclib", "-o", so, dir / "umami_metal.c", dir / "uirmetal.m", dir / "runner_metal.c", f"-I{runtime_dir}",
+          f"-L{runtime_dir}", "-lpacmetal", f"-Wl,-rpath,{rpath}", *METAL_FRAMEWORKS, "-lm"])
+    return str(so)
+
+
 def build_umami_library(dir, lib: UmamiLibrary, l: Lowered, provider: dict, exported_count: int, parameters, *,
                         cc: Optional[str] = None, cflags: Flags = ("-O2",), interpreter: bool = False, device: str = "cpu",
                         nvcc: Optional[str] = None, cuda_arch: str = "native", nvflags: Flags = ("-O3",),
@@ -245,12 +303,15 @@ def build_umami_library(dir, lib: UmamiLibrary, l: Lowered, provider: dict, expo
     pool the library asks for (the first library of a process decides): `gpu_slots` slots (0: one per
     CPU) of `gpu_memory` device bytes each (a call needing more runs as several launches). precision
     "mixed" (a CUDA device only): pacops.h's PAC_MIXED, not the CPU's bits, so nvcc may contract
-    multiply-adds unless fmad = False."""
+    multiply-adds unless fmad = False. device "metal" (macOS): build_umami_metal (always mixed f32/df64)."""
     device = device_name(device)
     if device not in DEVICES:
-        raise UmamiError(f"device {device}: one of {DEVICES} (or {', '.join(DEVICE_ALIASES)})")
+        raise UmamiError(f"device {device}: one of {DEVICES} (or {', '.join(DEVICE_ALIASES)}, gpu)")
     if precision not in PRECISIONS:
         raise UmamiError(f"precision {precision}: one of {PRECISIONS}")
+    if device == "metal":
+        return build_umami_metal(dir, lib, l, provider, exported_count, parameters, cc=cc, cflags=cflags,
+                                 runtime_dir=runtime_dir)
     fmad = precision == "mixed" if fmad is None else fmad
     cuda = device in ("cuda", "cuda_provider")
     provider_build = device == "cuda_provider"
@@ -392,16 +453,23 @@ def umami_libraries(export, metadata, dir, *, optimize_programs: bool = True, in
     the vertex sums in f64; -DPAC_AMP32: the amplitudes in f32); `fmad = False`: no contracted
     multiply-adds. `device = "cuda_provider"` (alias "cuda_full"): the same GPU build, but each library
     identifies as a CUDA provider for MadSpace's GPU runtime: device pointers, the caller's stream,
-    nothing synchronized; `gpu_memory` is then the workspace budget of one launch. The libraries are
-    built in parallel (`jobs` at a time; default: the CPUs)."""
+    nothing synchronized; `gpu_memory` is then the workspace budget of one launch. `device = "metal"`
+    (macOS): each program on an Apple GPU through Metal (c/metal/), always in mixed f32/df64 precision
+    (`precision` is ignored), the libraries CPU providers; one slot pool per process
+    (`dir/libpacmetal.dylib`; PAC_METAL_SLOTS, PAC_METAL_CHUNK, PAC_METAL_SLOT_BYTES). `device = "gpu"`:
+    metal on macOS, cuda elsewhere. The libraries are built in parallel (`jobs` at a time; default: the
+    CPUs)."""
     device = device_name(device)
     if device not in DEVICES:
-        raise UmamiError(f"device {device}: one of {DEVICES} (or {', '.join(DEVICE_ALIASES)})")
+        raise UmamiError(f"device {device}: one of {DEVICES} (or {', '.join(DEVICE_ALIASES)}, gpu)")
     if precision not in PRECISIONS:
         raise UmamiError(f"precision {precision}: one of {PRECISIONS}")
-    if precision != "f64" and device not in ("cuda", "cuda_provider"):
-        raise UmamiError(f"precision = {precision} needs device = cuda or cuda_provider")
-    fmad = precision == "mixed" if fmad is None else fmad
+    if device == "metal":
+        _require_macos()
+        precision = "mixed"   # Metal has no f64: always mixed f32/df64
+    if precision != "f64" and device not in GPU_DEVICES:
+        raise UmamiError(f"precision = {precision} needs device = cuda, cuda_provider or metal")
+    fmad = (precision == "mixed" and device != "metal") if fmad is None else fmad
     if fmad and precision == "f64":
         raise UmamiError("fmad = True is not the CPU's bits: precision = mixed only")
     kernels.require_symjit()   # symjit >= 2.29 (the kernels' MIR), before any work
@@ -421,6 +489,8 @@ def umami_libraries(export, metadata, dir, *, optimize_programs: bool = True, in
         if nvcc is None:
             raise UmamiError("a CUDA device needs nvcc (NVCC, the PATH or /usr/local/cuda/bin)")
         build_cuda_runtime(dir, nvcc, cuda_arch, pool=device == "cuda")
+    if device == "metal":
+        build_metal_runtime(dir, cc)
 
     def build(k: int) -> str:
         lib = libraries[k]
@@ -465,7 +535,7 @@ def main(argv=None) -> int:
     ap.add_argument("export")
     ap.add_argument("metadata")
     ap.add_argument("dir")
-    ap.add_argument("--device", default="cpu", choices=DEVICES + tuple(DEVICE_ALIASES))
+    ap.add_argument("--device", default="cpu", choices=DEVICES + tuple(DEVICE_ALIASES) + ("gpu",))
     ap.add_argument("--precision", default="f64", choices=PRECISIONS)
     ap.add_argument("--interpreter", action="store_true", help="the UIR interpreter's data instead of straight-line C")
     ap.add_argument("--imported", action="store_true", help="the programs as imported (not optimized)")
