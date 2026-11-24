@@ -11,6 +11,11 @@ without flushing denormals: the CPU keeps them) bit for bit.
   Propagators    propagator:<weyl_a|weyl_b|vector>:mixed against shim_propagator
   Wavefunctions  wave:<scalar|weyl|dirac|gluon|massive_vector>:...:mixed against shim_wavefunction, on
                  random momenta and the branches' edges (E < 0, on the z axis, pz = 0, at rest)
+  Programs       whole programs (compile_simd.MixedAssembler, downgraded with its roles) against the
+                 program's runner.metal on the CPU (compile_metal, test/metal_shim_run.cpp with
+                 -DSHIM_KEEP_DENORMALS), bit for bit: per golden export without model kernels, sampled
+                 programs as exported and with a leg permutation (a crossing), at the export's reference
+                 points; and the matrix element against RustiCol's within mixed precision's target
 
 Skipped without symjit >= 2.29, a C++ compiler (CXX, default c++) or an x86-64 CPU with AVX2.
 
@@ -27,10 +32,11 @@ import unittest
 
 import numpy as np
 
-from goldens import ROOT
+from goldens import ROOT, golden_sets
 
-from pacrunner import kernels
-from pacrunner.codegen.compile_simd import host_lanes
+from pacrunner import codegen, kernels, uir, umami
+from pacrunner.codegen.compile_simd import MixedAssembler, host_lanes
+from pacrunner.uir.types import is_kernel
 from pacrunner.simd import downgrade as D
 from pacrunner.simd import library, mixed
 from test_downgrade import Machine
@@ -242,6 +248,82 @@ class Propagators(_Shim):
                     got = Machine(code32).run(np.array(rows), 2 * n, 2 * lanes, np.float32).astype(np.float32)
                     differ = int((got.view(np.uint32) != want.view(np.uint32)).sum())
                     self.assertEqual(differ, 0, f"{differ} of {want.size} values differ")
+
+
+SETS = [(n.split("/")[-1], e) for (n, d, e, m) in golden_sets()]
+
+
+def split_columns(X):
+    """momenta X[points, 4 legs] as the mixed kernel's states: the hi parts, then the lo parts"""
+    hi = X.astype(np.float32).astype(np.float64)
+    lo = (X - hi).astype(np.float32).astype(np.float64)
+    return np.hstack([hi, lo])
+
+
+@unittest.skipUnless(HAVE_SYMJIT and HAVE_CXX and 4 in host_lanes(), "no symjit >= 2.29, C++ compiler or AVX2")
+class Programs(unittest.TestCase):
+    PER = 2           # programs sampled per export
+
+    def shim(self, l, X, where):
+        import importlib
+        cm = importlib.import_module("pacrunner.codegen.compile_metal")
+        codegen.compile_metal(where, l)
+        so = os.path.join(where, "shim.so")
+        subprocess.run([*CXX.split(), "-std=c++17", "-O1", "-ffp-contract=off", "-fPIC", "-shared", "-Wno-attributes",
+                        "-Wno-unused-function", "-DSHIM_KEEP_DENORMALS", f"-I{cm.METAL_DIR}", f"-I{where}", "-o", so,
+                        str(ROOT / "test" / "metal_shim_run.cpp")], check=True)
+        lib = ctypes.CDLL(so)
+        n = l.output_count()
+        m = np.ascontiguousarray(X.reshape(-1))
+        out = np.zeros(n * len(X))
+        with open(os.path.join(where, "program.bin"), "rb") as f:
+            program = f.read()
+        status = lib.shim_run(ctypes.c_char_p(program), m.ctypes.data_as(ctypes.c_void_p), ctypes.c_size_t(len(X)),
+                              out.ctypes.data_as(ctypes.c_void_p))
+        self.assertEqual(status, 0)
+        return out.reshape(len(X), n)
+
+    def test_programs_are_the_metal_runners_bits(self):
+        import symjit
+        checked = 0
+        for name, export in SETS:
+            ls, refs = uir.load_recurrence_export(export), uir.recurrence_references(export)
+            cand = [k for k, l in enumerate(ls) if refs[k] is not None and not any(is_kernel(o.op) for o in l.ops)]
+            if not cand:
+                continue
+            for k in sorted({cand[int(i)] for i in np.linspace(0, len(cand) - 1, self.PER)}):
+                pts = np.array([np.array(p, dtype=float).ravel() for p in refs[k][0]])
+                for variant in ("exported", "permuted"):
+                    l = ls[k]
+                    if variant == "permuted":
+                        perm = list(range(l.legs))
+                        perm[0], perm[-1] = perm[-1], perm[0]
+                        l = umami.permuted(l, perm)
+                    with self.subTest(export=name, program=k, variant=variant), tempfile.TemporaryDirectory() as where:
+                        a = MixedAssembler(l)
+                        app = a.assemble()
+                        n = l.output_count()
+                        for lanes in host_lanes():
+                            X = np.resize(pts, (4 * lanes, pts.shape[1]))
+                            want = self.shim(l, X, where) if lanes == host_lanes()[0] else want
+                            app["program"]["config"]["options"]["enable_simd512"] = lanes == 8
+                            f = symjit.load_json(json.dumps(app))
+                            path = os.path.join(where, "k.bin")
+                            f.dump(path, "simd")
+                            with open(path, "rb") as fb:
+                                code = fb.read()
+                            code32 = D.downgrade(code, consts=app["mir"]["consts"], roles=a.roles)
+                            got = Machine(code32).run(split_columns(X), 2 * n, 2 * lanes, np.float32)
+                            value = got[:, :n] + got[:, n:]
+                            w = np.resize(want, value.shape)
+                            same = (value == w) | (np.isnan(value) & np.isnan(w))
+                            self.assertTrue(same.all(), f"lanes {lanes}: {int((~same).sum())} of {same.size} differ")
+                            if variant == "exported":
+                                me, ref = value.sum(axis=1), np.resize(np.array(refs[k][1]).sum(axis=1), len(value))
+                                self.assertLess(float(np.max(np.abs(me / ref - 1))), 1e-5)
+                        checked += 1
+        if not checked:
+            self.skipTest("no golden program without model kernels")
 
 
 if __name__ == "__main__":

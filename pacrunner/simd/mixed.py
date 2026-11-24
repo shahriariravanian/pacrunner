@@ -298,3 +298,124 @@ def wave_massive_vector(h: int) -> dict:
 
 def wave_scalar() -> dict:
     return _wave("wave:scalar:mixed", 1, False, lambda d, k, _: [_creal(d, d.exact(1.0))])
+
+
+# ---- the rows' dd arithmetic (uirvm.metal) ------------------------------------------------------------
+
+def _dd_inputs(names):
+    return [f"{n}.{p}" for n in names for p in ("hi", "lo")]
+
+
+def closure(n: int) -> dict:
+    """closure:<n>:mixed: amplitude += Σ_j rmul(rmul(l_j, r_j), c_j) (c_j = rmul(cf_j, f), the
+    assembler's f32 constant), the products in f32, each added to the dd amplitude as dd_f (pacops.metal
+    closure)"""
+    inputs = [f"{a}{j}.{p}" for a in ("l", "r", "c") for j in range(n) for p in ("re", "im")]
+    inputs += _dd_inputs(["amp.re", "amp.im"])
+    m = Mir(inputs, 4, f"closure:{n}:mixed")
+    d = DD(m)
+    re, im = d.input("amp.re"), d.input("amp.im")
+    for j in range(n):
+        lj = R(m, m.input(f"l{j}.re"), m.input(f"l{j}.im"))
+        rj = R(m, m.input(f"r{j}.re"), m.input(f"r{j}.im"))
+        cj = R(m, m.input(f"c{j}.re"), m.input(f"c{j}.im"))
+        t = (lj * rj) * cj
+        re = d.add(re, d.of(t.re))
+        im = d.add(im, d.of(t.im))
+    for k, x in enumerate((re.hi, re.lo, im.hi, im.lo)):
+        m.output(k, x)
+    return m.fragment()
+
+
+def form(terms: int, crossing: bool) -> dict:
+    """form:<terms>:<plain|crossed>:mixed: q = 0 + Σ coefficient_t × leg_t in dd, in term order (a crossed
+    leg: sign × the caller's leg); outputs q (hi, lo) and q rounded (the three-vector vertex's)"""
+    names = [f"m{t}" for t in range(terms)] + [f"c{t}" for t in range(terms)]
+    names += [f"s{t}" for t in range(terms)] if crossing else []
+    m = Mir(_dd_inputs(names), 3, f"form:{terms}:{'crossed' if crossing else 'plain'}:mixed")
+    d = DD(m)
+    v = d.exact(0.0)
+    for t in range(terms):
+        x = d.input(f"m{t}")
+        if crossing:
+            x = d.mul(d.input(f"s{t}"), x)
+        v = d.add(v, d.mul(d.input(f"c{t}"), x))
+    m.output(0, v.hi)
+    m.output(1, v.lo)
+    m.output(2, d.to_plain(v))
+    return m.fragment()
+
+
+def _cmul(d: DD, a, b):
+    """cdd_mul: (a.re b.re - a.im b.im, a.re b.im + a.im b.re) in dd"""
+    return (d.sub(d.mul(a[0], b[0]), d.mul(a[1], b[1])), d.add(d.mul(a[0], b[1]), d.mul(a[1], b[0])))
+
+
+def cmul_round() -> dict:
+    """cmul_round:mixed: rof(cdd_mul(f, v)): a source component (the factor × the wavefunction's, in dd)
+    rounded once into the plane"""
+    m = Mir(_dd_inputs(["f.re", "f.im", "v.re", "v.im"]), 2, "cmul_round:mixed")
+    d = DD(m)
+    re, im = _cmul(d, (d.input("f.re"), d.input("f.im")), (d.input("v.re"), d.input("v.im")))
+    m.output(0, d.to_plain(re))
+    m.output(1, d.to_plain(im))
+    return m.fragment()
+
+
+def reduce(scaled: bool) -> dict:
+    """reduce:<plain|scaled>:mixed: acc + weight × (a.re a.re + a.im a.im), a = the amplitude (× its scale),
+    all in dd (pacops.metal reduce_term)"""
+    names = ["amp.re", "amp.im"] + (["s.re", "s.im"] if scaled else []) + ["w", "acc"]
+    m = Mir(_dd_inputs(names), 2, f"reduce:{'scaled' if scaled else 'plain'}:mixed")
+    d = DD(m)
+    a = (d.input("amp.re"), d.input("amp.im"))
+    if scaled:
+        a = _cmul(d, a, (d.input("s.re"), d.input("s.im")))
+    w, acc = d.input("w"), d.input("acc")
+    v = d.add(acc, d.mul(w, d.add(d.mul(a[0], a[0]), d.mul(a[1], a[1]))))
+    m.output(0, v.hi)
+    m.output(1, v.lo)
+    return m.fragment()
+
+
+def group() -> dict:
+    """group:mixed: x × numerator ÷ denominator in dd (both dd_int)"""
+    m = Mir(_dd_inputs(["x", "n", "d"]), 2, "group:mixed")
+    d = DD(m)
+    v = d.div(d.mul(d.input("x"), d.input("n")), d.input("d"))
+    m.output(0, v.hi)
+    m.output(1, v.lo)
+    return m.fragment()
+
+
+def fragment(name: str) -> dict:
+    """the mixed fragment `name` (…:mixed)"""
+    p = name.split(":")
+    if p[-1] != "mixed":
+        raise ValueError(f"{name}: not a mixed fragment")
+    p = p[:-1]
+    if p[0] == "propagator":
+        return propagator(p[1])
+    if p[0] == "closure":
+        return closure(int(p[1]))
+    if p[0] == "form":
+        return form(int(p[1]), p[2] == "crossed")
+    if p[0] == "cmul_round":
+        return cmul_round()
+    if p[0] == "reduce":
+        return reduce(p[1] == "scaled")
+    if p[0] == "group":
+        return group()
+    if p[0] == "wave":
+        if p[1] == "scalar":
+            return wave_scalar()
+        if p[1] == "weyl":
+            return wave_weyl(p[2] == "anti", int(p[3]), int(p[4]))
+        if p[1] == "dirac":
+            anti, h = p[2] == "anti", int(p[3])
+            return wave_dirac_massive(anti, h) if p[4] == "massive" else wave_dirac_massless(anti, h)
+        if p[1] == "gluon":
+            return wave_gluon(int(p[2]))
+        if p[1] == "massive_vector":
+            return wave_massive_vector(int(p[2]))
+    raise ValueError(f"no mixed fragment {name!r}")

@@ -40,6 +40,7 @@ from pathlib import Path
 from typing import Optional, Sequence
 
 from ..simd import library
+from ..simd import mixed as mixed_fragments
 from ..uir import (InputKind, Lowered, Opcode, PhysicalType, is_kernel, is_propagator, is_vertex, source_fields,
                    validate)
 from .common import ArenaIndex, CompileError, cstring
@@ -63,6 +64,27 @@ class SimdError(CompileError):
 
 def bits(x: float) -> str:
     return "0x%016x" % struct.unpack("<Q", struct.pack("<d", float(x)))[0]
+
+
+class DDC(float):
+    """a part of a dd constant (the mixed kernels): `part` "hi" or "lo" of the double `exact`. In the
+    f64 + double-double kernel the pair is (exact, 0.0); the downgrade (simd/downgrade.py, the kernel's
+    roles) splits it as the Metal host does: (fl32(exact), fl32(exact - fl32(exact)))."""
+
+    def __new__(cls, part: str, exact: float):
+        o = super().__new__(cls, float(exact) if part == "hi" else 0.0)
+        o.part, o.exact = part, float(exact)
+        return o
+
+
+def ckey(x) -> object:
+    """a constant's key in the pool: its bits; a dd part's, its part and its exact value's"""
+    return (x.part, bits(x.exact)) if isinstance(x, DDC) else bits(x)
+
+
+def role(x) -> list:
+    """a constant's role (the downgrade's): ["plain"], or ["hi" | "lo", exact]"""
+    return [x.part, x.exact] if isinstance(x, DDC) else ["plain"]
 
 
 def cmul(a: complex, b: complex) -> complex:
@@ -169,7 +191,7 @@ class Assembler:
     def __init__(self, prog: Lowered, call=called):
         validate(prog)
         self.prog, self.b = prog, ArenaIndex.of(prog)
-        self.code, self.consts, self.cidx = [], [], {}
+        self.code, self.consts, self.cidx, self.roles = [], [], {}, []
         self.frags = {}
         self.rows_done = 0
         self.scratch_used = 0
@@ -179,14 +201,22 @@ class Assembler:
         self.results = 0
         self.bodies = []
         self.T = None
+        self.extra = 0          # the mixed kernels' slots after the arena (MixedAssembler)
 
     # ---- slots and constants ----
     def const(self, x) -> int:
-        k = bits(x)
+        k = ckey(x)
         if k not in self.cidx:
             self.cidx[k] = len(self.consts)
-            self.consts.append(k)
+            self.consts.append(bits(x))
+            self.roles.append(role(x))
         return self.cidx[k]
+
+    def count_states(self) -> int:
+        return 4 * self.prog.legs
+
+    def count_obs(self) -> int:
+        return self.prog.output_count()
 
     def momentum(self, leg, j):
         return {"Mem": 4 * leg + j}
@@ -202,6 +232,9 @@ class Assembler:
         if kind == "arena":
             return {"Stack": base + i}
         base += self.b.size
+        if kind == "extra":
+            return {"Stack": base + i}
+        base += self.extra
         if kind == "scratch":
             return {"Stack": base + i}
         base += self.scratch_used
@@ -220,6 +253,10 @@ class Assembler:
             else:
                 self.frags[name] = library.fragment(name)
         return self.frags[name]
+
+    def row_factor(self, x) -> complex:
+        """the factor x of a scale, copy or scatter row"""
+        return self.prog.factors[x]
 
     # ---- raw MIR ----
     def emit(self, ins):
@@ -296,6 +333,7 @@ class Assembler:
             if c not in self.cidx:
                 self.cidx[c] = len(self.consts)
                 self.consts.append(c)
+                self.roles.append(["plain"])
             cmap[k] = self.cidx[c]
         prefix = prefix or f"r{self.rows_done}_"
         out, written = [], set()
@@ -450,14 +488,14 @@ class Assembler:
         elif o == Opcode.CLEAR_AMPLITUDE:
             self.zero(list(self.amp(op.d)))
         elif o == Opcode.SCALE_ROW:          # c[j] = mul(f, c[j])
-            f = p.factors[op.x]
+            f = self.row_factor(op.x)
             for j in range(op.n):
                 re, im = self.edge(op.d, j)
                 self.cmul_const(re, im, f, a_first=False)
                 self.save(re, 0)
                 self.save(im, 1)
         elif o == Opcode.COPY:               # out[j] = src[j] × f (0 for a zero factor)
-            f = p.factors[op.x]
+            f = self.row_factor(op.x)
             n = p.edge_layout(op.d).components
             for j in range(n):
                 dre, dim = self.edge(op.d, j)
@@ -514,7 +552,7 @@ class Assembler:
     def scatter(self, op):
         """out[j] (mode)= scatter_value(src[j], f) with pacops' shortcuts (f is a constant)"""
         p = self.prog
-        f = p.factors[op.x]
+        f = self.row_factor(op.x)
         n = p.edge_layout(op.d).components
         for j in range(n):
             sre, sim = self.edge(op.l, j)
@@ -651,7 +689,7 @@ class Assembler:
             d = self.frag(name)
             baked, args = {}, []
             for n in d["inputs"]:
-                vals = {bits(s.inputs[n]) if isinstance(s.inputs[n], float) else None for s in sites}
+                vals = {ckey(s.inputs[n]) if isinstance(s.inputs[n], float) else None for s in sites}
                 if len(vals) == 1 and None not in vals:
                     baked[n] = sites[0].inputs[n]
                 else:
@@ -663,7 +701,7 @@ class Assembler:
             for s in sites:
                 for n in args:
                     if isinstance(s.inputs[n], float):
-                        self.cslots.setdefault(bits(s.inputs[n]), (len(self.cslots), s.inputs[n]))
+                        self.cslots.setdefault(ckey(s.inputs[n]), (len(self.cslots), s.inputs[n]))
         self.results = max((self.frag(n)["outputs"] for n in self.sites), default=0)
         code = []
         for (i, x) in self.cslots.values():
@@ -674,7 +712,7 @@ class Assembler:
                 code.append(item)
                 continue
             baked, args = plans[item.name]
-            locs = [self.loc(("cslot", self.cslots[bits(t)][0]) if isinstance(t, float) else t)
+            locs = [self.loc(("cslot", self.cslots[ckey(t)][0]) if isinstance(t, float) else t)
                     for t in (item.inputs[n] for n in args)]
             code.append({"LoadArgs": {"locs": locs, "complex": False, "ultra": True}})
             code.append({"Call": {"label": self.label(item.name) + "_ultra", "num_args": 0}})
@@ -704,7 +742,7 @@ class Assembler:
 
     def application(self):
         p = self.prog
-        stack = self.T + self.b.size + self.scratch_used + len(self.cslots) + self.results
+        stack = self.T + self.b.size + self.extra + self.scratch_used + len(self.cslots) + self.results
         cfg = library.config()
         opts = cfg["options"]
         opts.update({"use_threads": False, "fastmath": False, "compress": bool(self.bodies), "ultra": bool(self.bodies),
@@ -713,7 +751,7 @@ class Assembler:
         version = library.fragment(library.catalogue()[0])["symjit_version"]
         return {
             "format": "symjit-application", "format_version": 1, "symjit_version": version,
-            "program": {"config": cfg, "count_states": 4 * p.legs, "count_params": 0, "count_obs": p.output_count(),
+            "program": {"config": cfg, "count_states": self.count_states(), "count_params": 0, "count_obs": self.count_obs(),
                         "count_diffs": 0, "count_loops": 0,
                         "builder": {"consts": self.consts, "count_loops": 0, "count_stack": stack, "ft": []}},
             "prepared": {"compiled": True, "fast": False, "simd": False},
@@ -724,7 +762,245 @@ class Assembler:
     def stats(self) -> dict:
         return {"rows": len(self.prog.ops), "instructions": len(self.code) + len(self.bodies),
                 "bodies": len(self.bodies), "calls": sum(len(v) for v in self.sites.values()),
-                "constants": len(self.consts), "stack": self.T + self.b.size + self.scratch_used + len(self.cslots) + self.results}
+                "constants": len(self.consts),
+                "stack": self.T + self.b.size + self.extra + self.scratch_used + len(self.cslots) + self.results}
+
+
+# ---- the mixed kernels (f64 + double-double, downgraded to the Metal runner's f32 + df64) ----------------
+
+def fl32(x: float) -> float:
+    """x rounded to f32 (to nearest)"""
+    return struct.unpack("<f", struct.pack("<f", float(x)))[0]
+
+
+def rf(z: complex) -> complex:
+    """a table value as the Metal runner's f32 copy (rscales, rfactors)"""
+    return complex(fl32(z.real), fl32(z.imag))
+
+
+def rmul32(a: complex, b: complex) -> complex:
+    """pacops.metal rmul in f32: each operation rounded once (in double, then to f32: correctly rounded,
+    a double holding more than twice a float's digits)"""
+    re = fl32(fl32(a.real * b.real) - fl32(a.imag * b.imag))
+    im = fl32(fl32(a.real * b.imag) + fl32(a.imag * b.real))
+    return complex(re, im)
+
+
+def dd(x: float) -> tuple:
+    """a dd constant's parts (DDC)"""
+    return DDC("hi", x), DDC("lo", x)
+
+
+class MixedAssembler(Assembler):
+    """the mixed kernel (plans/F32-KERNEL.md): the Metal runner's uir_run (c/metal/uirvm.metal) as an
+    f64 + double-double kernel, which simd/downgrade.py turns into its f32 + df64 twin, bit for bit the
+    Metal runner's. The states: the momenta's hi parts (Mem 4 leg + j), then their lo parts; the outputs:
+    hi parts, then lo parts (Mem 8 legs + h, + outputs). The forms and amplitudes are dd: their hi parts in
+    the arena, their lo parts after it ("extra"), then the forms rounded (the three-vector vertex's). The
+    rows' f32 constants are folded as the Metal runner computes them (rmul32 of rf), its df64 tables are dd
+    constants (DDC), its roles in `roles`. Not yet: model kernels."""
+
+    def __init__(self, prog: Lowered, call=called):
+        super().__init__(prog, call)
+        for op in prog.ops:
+            if is_kernel(op.op):
+                raise SimdError("the mixed kernels do not support model kernels yet")
+        F, A = len(prog.forms), prog.amplitudes
+        self.nlo = 4 * F + 2 * A
+        self.extra = self.nlo + 4 * F
+
+    def count_states(self) -> int:
+        return 8 * self.prog.legs
+
+    def count_obs(self) -> int:
+        return 2 * self.prog.output_count()
+
+    def momentum_lo(self, leg, j):
+        return {"Mem": 4 * self.prog.legs + 4 * leg + j}
+
+    def out(self, h):
+        return {"Mem": 8 * self.prog.legs + h}
+
+    def out_lo(self, h):
+        return {"Mem": 8 * self.prog.legs + self.prog.output_count() + h}
+
+    def form_lo(self, f, j):
+        return ("extra", 4 * f + j)
+
+    def form_r(self, f, j):
+        return ("extra", self.nlo + 4 * f + j)
+
+    def amp_lo(self, a):
+        q = 4 * len(self.prog.forms) + 2 * a
+        return ("extra", q), ("extra", q + 1)
+
+    def frag(self, name):
+        if name.endswith(":mixed"):
+            if name not in self.frags:
+                self.frags[name] = mixed_fragments.fragment(name)
+            return self.frags[name]
+        return super().frag(name)
+
+    def frag_name(self, op):
+        p, o = self.prog, op.op
+        if is_propagator(o):
+            return f"propagator:{PROPAGATOR[o]}:mixed"
+        if o == Opcode.CLOSURE:
+            n = len(p.lists[op.t])
+            return f"closure:{n}:mixed" if n else None
+        if o == Opcode.SOURCE:
+            return self.wave_name(op)
+        return super().frag_name(op)
+
+    def wave_name(self, op):
+        (family, anti, h, ch) = source_fields(op)
+        mass = self.prog.scales[op.t].real
+        a = "anti" if anti else "part"
+        if family == PhysicalType.SCALAR:
+            return "wave:scalar:mixed"
+        if family == PhysicalType.WEYL:
+            return f"wave:weyl:{a}:{h}:{ch}:mixed"
+        if family == PhysicalType.DIRAC:     # pacops.metal: dd_abs(mass).hi < 1.0e-8f
+            return f"wave:dirac:{a}:{h}:{'massless' if abs(fl32(mass)) < fl32(1.0e-8) else 'massive'}:mixed"
+        if family == PhysicalType.VECTOR:
+            return f"wave:gluon:{h}:mixed" if mass == 0 else f"wave:massive_vector:{h}:mixed"
+        raise SimdError(f"a source of family {family}")
+
+    def form_name(self, f):
+        return f"form:{len(f.terms)}:{'plain' if self.prog.crossing is None else 'crossed'}:mixed"
+
+    def needed(self):
+        p = self.prog
+        names = {self.frag_name(op) for op in p.ops} | {self.form_name(f) for f in p.forms}
+        names |= {"cmul_round:mixed", "reduce:plain:mixed", "reduce:scaled:mixed", "group:mixed"}
+        return sorted(n for n in names if n)
+
+    def amp_inputs(self, a):
+        (re, im), (lre, lim) = self.amp(a), self.amp_lo(a)
+        return {"amp.re.hi": re, "amp.re.lo": lre, "amp.im.hi": im, "amp.im.lo": lim}
+
+    def assemble(self):
+        p, b = self.prog, self.b
+        stacks = [self.frag(n)["count_stack"] for n in self.needed()]
+        self.T = max([80, *stacks])
+        self.zero([("arena", i) for i in range(b.size)] + [("extra", i) for i in range(self.extra)])
+        self.zero([t for h in range(p.output_count()) for t in (self.out(h), self.out_lo(h))])
+        for i, f in enumerate(p.forms):          # uir_forms_layout: 0 + Σ coefficient × (sign ×) leg, in dd
+            name = self.form_name(f)
+            for j in range(4):
+                ins = {}
+                for t, (leg, coef) in enumerate(f.terms):
+                    if p.crossing is not None:
+                        (leg, sign) = p.crossing[leg]
+                        ins[f"s{t}.hi"], ins[f"s{t}.lo"] = dd(sign)
+                    ins[f"m{t}.hi"], ins[f"m{t}.lo"] = self.momentum(leg, j), self.momentum_lo(leg, j)
+                    ins[f"c{t}.hi"], ins[f"c{t}.lo"] = dd(coef)
+                self.inline(name, ins, [self.form(i, j), self.form_lo(i, j), self.form_r(i, j)])
+        for op in p.ops:
+            self.row(op)
+            self.rows_done += 1
+        (num, den) = p.group_factor
+        if num != den:                           # uir_group: x × dd_int(num) ÷ dd_int(den)
+            for h in range(p.output_count()):
+                ins = {"x.hi": self.out(h), "x.lo": self.out_lo(h)}
+                ins["n.hi"], ins["n.lo"] = dd(float(num))
+                ins["d.hi"], ins["d.lo"] = dd(float(den))
+                self.inline("group:mixed", ins, [self.out(h), self.out_lo(h)])
+        self.finish()
+        return self.application()
+
+    def row(self, op):
+        p, o = self.prog, op.op
+        name = self.frag_name(op)
+        if is_vertex(o):                         # vertex_row: s = rmul(rscale, rfactor) in f32
+            nl, nr, no = library.VERTICES[VERTEX[o]]
+            ins = {**self.current_inputs("l", op.l, nl), **self.current_inputs("r", op.r, nr)}
+            s = rmul32(rf(p.scales[op.t]), rf(p.factors[op.x]))
+            ins["s.re"], ins["s.im"] = s.real, s.imag
+            if o == Opcode.V_THREE_VECTOR:       # the forms rounded (load_form_r)
+                fu, fv = p.edge_form(op.l), p.edge_form(op.r)
+                for j in range(4):
+                    ins[f"u{j}"], ins[f"v{j}"] = self.form_r(fu, j), self.form_r(fv, j)
+                ins["two"] = 2.0
+            if not op.set:
+                ins.update(self.current_inputs("old", op.d, no))
+            self.inline(name, ins, [t for j in range(no) for t in self.edge(op.d, j)])
+        elif is_propagator(o):                   # the factor f32 (the vector's × (0, -1) in f32), k in dd
+            n = 4 if o == Opcode.P_VECTOR else 2
+            ins = self.current_inputs("c", op.d, n)
+            fd = p.edge_form(op.d)
+            for j in range(4):
+                ins[f"k{j}.hi"], ins[f"k{j}.lo"] = self.form(fd, j), self.form_lo(fd, j)
+            f = rf(p.factors[op.x])
+            if o == Opcode.P_VECTOR:
+                f = rmul32(f, complex(0.0, -1.0))
+            ins["f.re"], ins["f.im"] = f.real, f.imag
+            self.inline(name, ins, [t for j in range(n) for t in self.edge(op.d, j)])
+        elif o == Opcode.CLEAR_AMPLITUDE:
+            self.zero(list(self.amp(op.d)) + list(self.amp_lo(op.d)))
+        elif o == Opcode.CLOSURE:                # closure_row: c_j = rmul(rfactor_j, rfactor) in f32
+            entries = p.lists[op.t]
+            if not entries:
+                return
+            n = len(entries)
+            ins = {**self.current_inputs("l", op.l, n), **self.current_inputs("r", op.r, n)}
+            f = rf(p.factors[op.x])
+            for j, x in enumerate(entries):
+                c = rmul32(rf(p.factors[x]), f)
+                ins[f"c{j}.re"], ins[f"c{j}.im"] = c.real, c.imag
+            ins.update(self.amp_inputs(op.d))
+            a = self.amp_inputs(op.d)
+            self.inline(name, ins, [a["amp.re.hi"], a["amp.re.lo"], a["amp.im.hi"], a["amp.im.lo"]])
+        elif o == Opcode.SOURCE:
+            self.mixed_source(op, name)
+        elif o == Opcode.REDUCE:                 # run_reduce, in dd
+            ins = self.amp_inputs(op.t)
+            if op.x is not None:
+                s = p.factors[op.x]
+                ins["s.re.hi"], ins["s.re.lo"] = dd(s.real)
+                ins["s.im.hi"], ins["s.im.lo"] = dd(s.imag)
+            ins["w.hi"], ins["w.lo"] = dd(p.weights[op.n])
+            ins["acc.hi"], ins["acc.lo"] = self.out(op.d), self.out_lo(op.d)
+            self.inline(f"reduce:{'plain' if op.x is None else 'scaled'}:mixed", ins, [self.out(op.d), self.out_lo(op.d)])
+        else:
+            super().row(op)
+
+    def row_factor(self, x) -> complex:
+        """the Metal runner's f32 copy of the factor (rfactor): the f64 rows' MIR, which the downgrade makes
+        f32, on f32 constants"""
+        return rf(self.prog.factors[x])
+
+    def mixed_source(self, op, name):
+        """source_row: the bare wavefunction in dd, then each component × its factor (dd), rounded once
+        into the plane; an embedding's entries likewise, or 0"""
+        p = self.prog
+        (family, anti, h, ch) = source_fields(op)
+        n = {PhysicalType.SCALAR: 1, PhysicalType.WEYL: 2}.get(family, 4)
+        fd = p.edge_form(op.d)
+        ins = {}
+        for j in range(4):
+            ins[f"k{j}.hi"], ins[f"k{j}.lo"] = self.form(fd, j), self.form_lo(fd, j)
+        ins["mass.hi"], ins["mass.lo"] = dd(p.scales[op.t].real)
+        w = [("scratch", j) for j in range(4 * n)]
+        self.scratch_used = max(self.scratch_used, 4 * n)
+        self.inline(name, {k: ins[k] for k in self.frag(name)["inputs"]}, w)
+
+        def component(target_j, wave_j, z: complex):
+            c = {"v.re.hi": w[4 * wave_j], "v.re.lo": w[4 * wave_j + 1], "v.im.hi": w[4 * wave_j + 2],
+                 "v.im.lo": w[4 * wave_j + 3]}
+            c["f.re.hi"], c["f.re.lo"] = dd(z.real)
+            c["f.im.hi"], c["f.im.lo"] = dd(z.imag)
+            self.inline("cmul_round:mixed", c, list(self.edge(op.d, target_j)))
+
+        if op.l is None:
+            for j in range(n):
+                component(j, j, p.factors[op.x])
+        else:
+            for (comp, wv, x) in p.embeddings[op.l]:
+                if wv is None:
+                    self.zero(list(self.edge(op.d, comp)))
+                else:
+                    component(comp, wv, p.factors[x])
 
 
 def simd_application(prog: Lowered, call=called) -> tuple[dict, dict]:

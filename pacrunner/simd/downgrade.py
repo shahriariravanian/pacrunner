@@ -327,14 +327,45 @@ def rewrite_code(code: bytes, end: Optional[int] = None, stats: Optional[dict] =
     return out
 
 
-def downgrade(code: bytes, stats: Optional[dict] = None, consts: Optional[list] = None) -> bytes:
+def _f32(x: float) -> float:
+    return struct.unpack("<f", struct.pack("<f", x))[0]
+
+
+def _role_bits(r: list, q: int) -> int:
+    """a pool constant by its role (compile_simd.role): "plain" its value, which must be a float already
+    (the mixed kernels fold their f32 constants in f32); "hi" / "lo" a dd constant's parts split from its
+    exact value as the Metal host stages a double: (fl32(x), fl32(x - fl32(x)))"""
+    if r[0] == "plain":
+        x = struct.unpack("<d", struct.pack("<Q", q))[0]
+        if math.isfinite(x) and _f32(x) != x:
+            raise DowngradeError(f"the plain constant {x!r} is not a float (fold it in f32)")
+        return _float_bits(q)
+    x = float(r[1])
+    hi = _f32(x)
+    v = hi if r[0] == "hi" else (_f32(x - hi) if math.isfinite(hi) else 0.0)
+    h = struct.unpack("<I", struct.pack("<f", v))[0]
+    return h | (h << 32)
+
+
+def downgrade(code: bytes, stats: Optional[dict] = None, consts: Optional[list] = None,
+              roles: Optional[list] = None) -> bytes:
     """the f32 twin of an f64 SIMD kernel's machine code (`dump(.., "simd")`); `consts`: the kernel's
-    constant pool (its MIR's, data_start); `stats` collects the counts of what was rewritten"""
+    constant pool (its MIR's, data_start); `roles`: per pool constant its role (a mixed kernel's,
+    compile_simd.MixedAssembler.roles: dd constants split, plain ones checked); `stats` collects the counts
+    of what was rewritten"""
     start = data_start(code, consts)
     if start % 8 or len(code) % 8:
         raise DowngradeError(f"the data area (0x{start:x}..0x{len(code):x}) is not in 8-byte units")
     out = rewrite_code(code, start, stats)
-    for at in range(start, len(code), 8):
+    pool_end = start
+    if roles is not None:
+        if consts is None or len(roles) != len(consts):
+            raise DowngradeError("the roles need the constant pool, one role each")
+        for k, r in enumerate(roles):
+            at = start + 8 * k
+            struct.pack_into("<Q", out, at, _role_bits(r, struct.unpack_from("<Q", code, at)[0]))
+        pool_end = start + 8 * len(roles)
+    for at in range(pool_end, len(code), 8):
         struct.pack_into("<Q", out, at, _float_bits(struct.unpack_from("<Q", code, at)[0]))
     if stats is not None:
         stats["data quads"] = (len(code) - start) // 8
