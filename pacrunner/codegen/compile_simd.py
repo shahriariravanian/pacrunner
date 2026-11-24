@@ -889,7 +889,7 @@ class MixedAssembler(Assembler):
         p = self.prog
         names = {self.frag_name(op) for op in p.ops} | {self.form_name(f) for f in p.forms}
         names |= {"cmul_round:mixed", "reduce:plain:mixed", "reduce:scaled:mixed", "group:mixed"}
-        names |= {f"kout:{a}:{b}:mixed" for a in ("direct", "scaled") for b in ("set", "add")}
+        names |= {f"kout:{a}:{b}:mixed" for a in ("direct", "neg", "scaled") for b in ("set", "add")}
         return sorted(n for n in names if n)
 
     def amp_inputs(self, a):
@@ -1010,18 +1010,20 @@ class MixedAssembler(Assembler):
         res = [("scratch", j) for j in range(n_out)]
         self.scratch_used = max(self.scratch_used, n_out)
         self.inline(name, {n: ins[n] for n in d["inputs"]}, res)
-        scaled = o != Opcode.KERNEL_DIRECT
         mode = "set" if op.set else "add"
         z = p.factors[op.x]
+        # × (1, 0) and × (-1, 0) in dd are ± the pair (kout's doc): no multiply
+        kind = ("direct" if o == Opcode.KERNEL_DIRECT or z == complex(1.0, 0.0)
+                else "neg" if z == complex(-1.0, 0.0) else "scaled")
         for n, comp in enumerate(stub.outputs):
             c = {"p.re.hi": res[4 * n], "p.re.lo": res[4 * n + 1], "p.im.hi": res[4 * n + 2], "p.im.lo": res[4 * n + 3]}
-            if scaled:
+            if kind == "scaled":
                 c["f.re.hi"], c["f.re.lo"] = dd(z.real)
                 c["f.im.hi"], c["f.im.lo"] = dd(z.imag)
             dre, dim = self.edge(op.d, comp)
             if mode == "add":
                 c["old.re"], c["old.im"] = dre, dim
-            self.inline(f"kout:{'scaled' if scaled else 'direct'}:{mode}:mixed", c, [dre, dim])
+            self.inline(f"kout:{kind}:{mode}:mixed", c, [dre, dim])
 
     def row_factor(self, x) -> complex:
         """the Metal runner's f32 copy of the factor (rfactor): the f64 rows' MIR, which the downgrade makes

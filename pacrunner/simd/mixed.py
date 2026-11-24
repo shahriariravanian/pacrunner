@@ -407,7 +407,7 @@ def fragment(name: str) -> dict:
     if p[0] == "group":
         return group()
     if p[0] == "kout":
-        return kout(p[1] == "scaled", p[2] == "add")
+        return kout(p[1], p[2] == "add")
     if p[0] == "wave":
         if p[1] == "scalar":
             return wave_scalar()
@@ -423,17 +423,22 @@ def fragment(name: str) -> dict:
     raise ValueError(f"no mixed fragment {name!r}")
 
 
-def kout(scaled: bool, add: bool) -> dict:
+def kout(scaled, add: bool) -> dict:
     """kout:<direct|scaled>:<set|add>:mixed: a kernel row's output pair into its component (uirvm.metal
     uir_output): the pair (dd) × the row's factor (dd) unless direct, added to the old component widened
-    (add), rounded once into the plane"""
-    names = ["p.re", "p.im"] + (["f.re", "f.im"] if scaled else [])
+    (add), rounded once into the plane. A factor of exactly 1 is "direct", of exactly -1 "neg": cdd_mul by
+    (±1, 0) gives ±the pair (its products by 0 and ±1 exact, the normalized pair kept by fast_two_sum),
+    the same up to the sign of a zero"""
+    kind = scaled if isinstance(scaled, str) else ("scaled" if scaled else "direct")
+    names = ["p.re", "p.im"] + (["f.re", "f.im"] if kind == "scaled" else [])
     inputs = _dd_inputs(names) + (["old.re", "old.im"] if add else [])
-    m = Mir(inputs, 2, f"kout:{'scaled' if scaled else 'direct'}:{'add' if add else 'set'}:mixed")
+    m = Mir(inputs, 2, f"kout:{kind}:{'add' if add else 'set'}:mixed")
     d = DD(m)
     v = (d.input("p.re"), d.input("p.im"))
-    if scaled:
+    if kind == "scaled":
         v = _cmul(d, v, (d.input("f.re"), d.input("f.im")))
+    elif kind == "neg":          # cdd_mul(p, (-1, 0)) = -p: the products by 0 and ±1 are exact
+        v = (d.neg(v[0]), d.neg(v[1]))
     if add:
         v = (d.add(d.of(m.input("old.re")), v[0]), d.add(d.of(m.input("old.im")), v[1]))
     m.output(0, d.to_plain(v[0]))
