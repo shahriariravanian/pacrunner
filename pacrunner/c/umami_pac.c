@@ -60,7 +60,14 @@
  * end (pac_finish) on its column of outputs. The checks, the scales and the end are the CPU build's, and
  * the kernel computes runner.c's values: the CPU build's bits. A kernel call uses PAC_SIMD8_STACK_BYTES
  * (PAC_SIMD4_STACK_BYTES) of the calling thread's stack. The kernels are symjit's JIT code in object files
- * (compile_simd, simd/elf.py): no relocations, no library calls. */
+ * (compile_simd, simd/elf.py): no relocations, no library calls.
+ *
+ * With PAC_SIMD and PAC_SIMD_MIXED (device "simd", precision "mixed") the kernels are the mixed ones
+ * (compile_simd(precision = "mixed"): kernel8.o, pac_simd8, AVX2; kernel16.o, pac_simd16, AVX-512 with
+ * PAC_SIMD_HAVE16), the Metal runner's f32 + df64 arithmetic: 8 or 16 events per call (PAC_SIMD_LANES=8
+ * or 16 asks for one), float columns (the kernel reads element idx at byte 8 idx: called with idx / 2),
+ * each momentum component as its hi and lo parts ((float)x, (float)(x - hi): the Metal host's staging),
+ * each output as hi and lo parts, widened (double)hi + (double)lo for the event's end. */
 #include "umami.h"
 #include "runner.h"
 #include <math.h>
@@ -72,15 +79,26 @@
 #include "uirgpu.h"
 #endif
 #ifdef PAC_SIMD
+#ifndef PAC_SIMD_CHUNK
+#define PAC_SIMD_CHUNK 64                      /* events per kernel batch: a multiple of 16 */
+#endif
+#ifdef PAC_SIMD_MIXED
+#include "kernel8.h"
+#ifdef PAC_SIMD_HAVE16
+#include "kernel16.h"
+#endif
+#define PAC_SIMD_STATES PAC_SIMD8_COUNT_STATES   /* 8 x the legs: the momenta's hi parts, then their lo parts */
+#define PAC_SIMD_COLUMNS (PAC_SIMD8_COUNT_STATES + PAC_SIMD8_COUNT_OBS)
+typedef float pac_simd_real;
+#else
 #include "kernel4.h"
 #ifdef PAC_SIMD_HAVE8
 #include "kernel8.h"
 #endif
-#ifndef PAC_SIMD_CHUNK
-#define PAC_SIMD_CHUNK 64                      /* events per kernel batch: a multiple of 8 */
-#endif
 #define PAC_SIMD_STATES PAC_SIMD4_COUNT_STATES   /* 4 x the legs: the momenta */
 #define PAC_SIMD_COLUMNS (PAC_SIMD4_COUNT_STATES + PAC_SIMD4_COUNT_OBS)
+typedef double pac_simd_real;
+#endif
 typedef int (*pac_simd_kernel)(double *, const symjit_slice *, size_t, const double *);
 #endif
 
@@ -101,7 +119,10 @@ typedef struct {
 #ifdef PAC_SIMD
     pac_simd_kernel kernel;
     size_t lanes;
-    double *columns;                           /* PAC_SIMD_COLUMNS columns of PAC_SIMD_CHUNK events */
+    pac_simd_real *columns;                    /* PAC_SIMD_COLUMNS columns of PAC_SIMD_CHUNK events */
+#ifdef PAC_SIMD_MIXED
+    double widened[RUNNER_OUTPUTS * PAC_SIMD_CHUNK];   /* the outputs, hi + lo */
+#endif
     symjit_slice slices[PAC_SIMD_COLUMNS];
     double scale[PAC_SIMD_CHUNK], random[PAC_SIMD_CHUNK];
     int scaled[PAC_SIMD_CHUNK], fixed[PAC_SIMD_CHUNK];
@@ -116,9 +137,22 @@ typedef struct {
 } Instance;
 
 #ifdef PAC_SIMD
-/* the lanes of this CPU's kernel (8: AVX-512, 4: AVX2), PAC_SIMD_LANES if it asks for one; 0: none */
+/* the lanes of this CPU's kernel (8: AVX-512, 4: AVX2; mixed: 16, 8), PAC_SIMD_LANES if it asks for
+ * one; 0: none */
 static size_t simd_lanes(void) {
-#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__)) && defined(PAC_SIMD_MIXED)
+    __builtin_cpu_init();
+#ifdef PAC_SIMD_HAVE16
+    bool has16 = __builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512dq");
+#else
+    bool has16 = false;   /* built without the AVX-512 kernel */
+#endif
+    bool has8 = __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma");
+    char const *want = getenv("PAC_SIMD_LANES");
+    if (want != NULL && strcmp(want, "8") == 0) return has8 ? 8 : 0;
+    if (want != NULL && strcmp(want, "16") == 0) return has16 ? 16 : 0;
+    return has16 ? 16 : has8 ? 8 : 0;
+#elif defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
     __builtin_cpu_init();
 #ifdef PAC_SIMD_HAVE8
     bool has8 = __builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512dq");
@@ -143,15 +177,19 @@ static bool simd_setup(Instance *instance) {
                 "F and DQ and a library built on such a CPU)" : "");
         return false;
     }
-#ifdef PAC_SIMD_HAVE8
+#if defined(PAC_SIMD_MIXED) && defined(PAC_SIMD_HAVE16)
+    instance->kernel = instance->lanes == 16 ? pac_simd16 : pac_simd8;
+#elif defined(PAC_SIMD_MIXED)
+    instance->kernel = pac_simd8;
+#elif defined(PAC_SIMD_HAVE8)
     instance->kernel = instance->lanes == 8 ? pac_simd8 : pac_simd4;
 #else
     instance->kernel = pac_simd4;
 #endif
-    instance->columns = calloc((size_t)PAC_SIMD_COLUMNS * PAC_SIMD_CHUNK, sizeof(double));
+    instance->columns = calloc((size_t)PAC_SIMD_COLUMNS * PAC_SIMD_CHUNK, sizeof(pac_simd_real));
     if (instance->columns == NULL) return false;
     for (size_t j = 0; j < PAC_SIMD_COLUMNS; ++j) {
-        instance->slices[j].ptr = instance->columns + j * PAC_SIMD_CHUNK;
+        instance->slices[j].ptr = (double *)(instance->columns + j * PAC_SIMD_CHUNK);
         instance->slices[j].len = PAC_SIMD_CHUNK;
     }
     return true;
@@ -163,9 +201,21 @@ static bool simd_flush(Instance *instance, size_t n, size_t first, bool draw, vo
     for (size_t j = 0; j < PAC_SIMD_STATES; ++j)
         for (size_t c = n; c < padded; ++c)
             instance->columns[j * PAC_SIMD_CHUNK + c] = instance->columns[j * PAC_SIMD_CHUNK + n - 1];
+#ifdef PAC_SIMD_MIXED
+    for (size_t i = 0; i < padded; i += lanes)   /* floats: element i at byte 4 i = 8 (i / 2) */
+        if (instance->kernel(NULL, instance->slices, i / 2, NULL) != 0) return false;
+    pac_simd_real const *hi = instance->columns + (size_t)PAC_SIMD_STATES * PAC_SIMD_CHUNK;
+    pac_simd_real const *lo = hi + (size_t)RUNNER_OUTPUTS * PAC_SIMD_CHUNK;
+    for (size_t h = 0; h < RUNNER_OUTPUTS; ++h)
+        for (size_t c = 0; c < n; ++c)
+            instance->widened[h * PAC_SIMD_CHUNK + c] =
+                (double)hi[h * PAC_SIMD_CHUNK + c] + (double)lo[h * PAC_SIMD_CHUNK + c];
+    double const *values = instance->widened;
+#else
     for (size_t i = 0; i < padded; i += lanes)
         if (instance->kernel(NULL, instance->slices, i, NULL) != 0) return false;
     double const *values = instance->columns + (size_t)PAC_SIMD_STATES * PAC_SIMD_CHUNK;
+#endif
     for (size_t c = 0; c < n; ++c) {
         double me;
         int label;
@@ -407,7 +457,13 @@ PAC_EXPORT UmamiStatus umami_matrix_element(UmamiHandle handle, size_t count, si
             for (size_t k = 0; k < 4; ++k) {
                 double value = momenta[event + stride * (n * k + j)];
                 if (!isfinite(value)) return UMAMI_ERROR;
+#ifdef PAC_SIMD_MIXED
+                float hi = (float)value;   /* the Metal host's df64: (float)x, (float)(x - hi) */
+                instance->columns[(4 * j + k) * PAC_SIMD_CHUNK + c] = hi;
+                instance->columns[(4 * n + 4 * j + k) * PAC_SIMD_CHUNK + c] = (float)(value - (double)hi);
+#else
                 instance->columns[(4 * j + k) * PAC_SIMD_CHUNK + c] = value;
+#endif
             }
         instance->scale[c] = scale;
         instance->scaled[c] = event_scaled;

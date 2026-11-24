@@ -297,10 +297,12 @@ def build_umami_metal(dir, lib: UmamiLibrary, l: Lowered, provider: dict, export
 
 
 def build_umami_simd(dir, lib: UmamiLibrary, l: Lowered, provider: dict, exported_count: int, parameters, *,
-                     cc: Optional[str] = None, cflags: Flags = ("-O2",)) -> str:
+                     cc: Optional[str] = None, cflags: Flags = ("-O2",), precision: str = "f64") -> str:
     """build_umami_library for device "simd" (x86-64): compile_simd's folder (the permutation folded into the
     crossing; kernel4.o, the AVX2 kernel, and kernel8.o, the AVX-512 one, where this CPU has AVX-512) and
-    umami_pac.c with PAC_SIMD, linked with only the UMAMI functions exported"""
+    umami_pac.c with PAC_SIMD, linked with only the UMAMI functions exported. precision "mixed": the mixed
+    kernels (kernel8.o AVX2, kernel16.o AVX-512: f32 + df64, the Metal runner's arithmetic) and
+    PAC_SIMD_MIXED"""
     if not _env.simd_machine():
         raise UmamiError("device simd: x86-64 only (AVX2 and AVX-512 kernels)")
     if int(provider["particle_count"]) != l.legs:
@@ -310,7 +312,7 @@ def build_umami_simd(dir, lib: UmamiLibrary, l: Lowered, provider: dict, exporte
     dir = Path(dir)
     l = permuted(l, lib.permutation)   # the library reads the caller's legs
     try:
-        codegen.compile_simd(dir, l)
+        codegen.compile_simd(dir, l, precision=precision)
     except codegen.CompileError as e:
         raise UmamiError(f"{lib.process} {lib.colour}: {e}") from e
     (tables, program) = umami_program_h(lib, l, provider, exported_count, parameters)
@@ -322,8 +324,10 @@ def build_umami_simd(dir, lib: UmamiLibrary, l: Lowered, provider: dict, exporte
     exports.write_text("{ global: umami_*; local: *; };\n")
     hide = [f"-Wl,--version-script={exports}"] if sys.platform.startswith("linux") else []
     so = dir / f"libumami_pac.{SO}"
-    _run([*cc, *_flags(cflags), "-std=c99", "-ffp-contract=off", "-fPIC", "-fvisibility=hidden", "-DPAC_SIMD", "-shared",
-          *hide, "-o", so, dir / "umami_pac.c", *sorted(dir.glob("kernel[48].o")), "-lm"])
+    mixed = precision == "mixed"
+    objects = [dir / f"kernel{n}.o" for n in ((8, 16) if mixed else (4, 8)) if (dir / f"kernel{n}.o").is_file()]
+    _run([*cc, *_flags(cflags), "-std=c99", "-ffp-contract=off", "-fPIC", "-fvisibility=hidden", "-DPAC_SIMD",
+          *(["-DPAC_SIMD_MIXED"] if mixed else []), "-shared", *hide, "-o", so, dir / "umami_pac.c", *objects, "-lm"])
     return str(so)
 
 
@@ -350,9 +354,8 @@ def build_umami_library(dir, lib: UmamiLibrary, l: Lowered, provider: dict, expo
         return build_umami_metal(dir, lib, l, provider, exported_count, parameters, cc=cc, cflags=cflags,
                                  runtime_dir=runtime_dir)
     if device == "simd":
-        if precision != "f64":
-            raise UmamiError(f"precision = {precision} needs device = cuda or cuda_provider")
-        return build_umami_simd(dir, lib, l, provider, exported_count, parameters, cc=cc, cflags=cflags)
+        return build_umami_simd(dir, lib, l, provider, exported_count, parameters, cc=cc, cflags=cflags,
+                                precision=precision)
     fmad = precision == "mixed" if fmad is None else fmad
     cuda = device in ("cuda", "cuda_provider")
     provider_build = device == "cuda_provider"
@@ -510,9 +513,9 @@ def umami_libraries(export, metadata, dir, *, optimize_programs: bool = True, in
     if device == "metal":
         _require_macos()
         precision = "mixed"   # Metal has no f64: always mixed f32/df64
-    if precision != "f64" and device not in GPU_DEVICES:
-        raise UmamiError(f"precision = {precision} needs device = cuda, cuda_provider or metal")
-    fmad = (precision == "mixed" and device != "metal") if fmad is None else fmad
+    if precision != "f64" and device not in GPU_DEVICES + ("simd",):
+        raise UmamiError(f"precision = {precision} needs device = cuda, cuda_provider, metal or simd")
+    fmad = (precision == "mixed" and device not in ("metal", "simd")) if fmad is None else fmad
     if fmad and precision == "f64":
         raise UmamiError("fmad = True is not the CPU's bits: precision = mixed only")
     kernels.require_symjit()   # symjit >= 2.29 (the kernels' MIR), before any work

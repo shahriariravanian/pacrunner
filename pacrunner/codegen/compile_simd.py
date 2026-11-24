@@ -1027,12 +1027,18 @@ def host_lanes() -> tuple[int, ...]:
     return out
 
 
-def runner_h(prog: Lowered, lanes: Sequence[int]) -> str:
-    have8 = "#define PAC_SIMD_HAVE8 1\n" if 8 in lanes else ""
+def runner_h(prog: Lowered, lanes: Sequence[int], mixed: bool = False) -> str:
+    if mixed:      # the f32 lanes: 8 (AVX2), 16 (AVX-512)
+        have = "#define PAC_SIMD_MIXED 1\n" + ("#define PAC_SIMD_HAVE16 1\n" if 8 in lanes else "")
+        what = f"kernel8.h: pac_simd8, AVX2{'; kernel16.h: pac_simd16, AVX-512' if 8 in lanes else ''}, mixed f32/df64; " \
+               "states the momenta's hi then lo parts, outputs the helicity outputs' hi then lo parts"
+    else:
+        have = "#define PAC_SIMD_HAVE8 1\n" if 8 in lanes else ""
+        what = f"kernel4.h: pac_simd4, AVX2{'; kernel8.h: pac_simd8, AVX-512' if 8 in lanes else ''}; states the " \
+               "momenta, outputs the helicity outputs"
     return f"""\
 /* {prog.process} {prog.colour}: the program as SIMD kernels, by PacRunner's compile_simd
- * (kernel4.h: pac_simd4, AVX2{"; kernel8.h: pac_simd8, AVX-512" if 8 in lanes else ""}; states the momenta, outputs
- * the helicity outputs). */
+ * ({what}). */
 #ifndef RUNNER_H
 #define RUNNER_H
 
@@ -1041,14 +1047,21 @@ def runner_h(prog: Lowered, lanes: Sequence[int]) -> str:
 #define RUNNER_LEGS {prog.legs}
 #define RUNNER_OUTPUTS {prog.output_count()}
 #define RUNNER_ARENA_SIZE {ArenaIndex.of(prog).size}
-{have8}
+{have}
 #endif
 """
 
 
-def compile_simd(path, prog: Lowered, lanes: Optional[Sequence[int]] = None):
+def compile_simd(path, prog: Lowered, lanes: Optional[Sequence[int]] = None, precision: str = "f64"):
     """the folder of `prog` (see the module); returns `path`. `lanes`: the kernels, 4 and (where this CPU
-    has AVX-512, as symjit compiles it only there) 8; default host_lanes()"""
+    has AVX-512, as symjit compiles it only there) 8; default host_lanes(). precision "mixed": the mixed
+    kernels (MixedAssembler, downgraded by simd/downgrade.py to f32 + df64: the Metal runner's bits), 8 and
+    16 lanes (kernel8.o pac_simd8, kernel16.o pac_simd16); kernel.json is then the f64 + double-double
+    application and kernel_roles.json its constants' roles"""
+    if precision == "mixed":
+        return compile_simd_mixed(path, prog, lanes)
+    if precision != "f64":
+        raise SimdError(f"precision {precision!r}: f64 or mixed")
     import symjit
     from ..simd import elf
     lanes = tuple(host_lanes() if lanes is None else lanes)
@@ -1076,4 +1089,40 @@ def compile_simd(path, prog: Lowered, lanes: Optional[Sequence[int]] = None):
         (path / f"kernel{n}.o").write_bytes(elf.elf_object(symbol, code))
         (path / f"kernel{n}.h").write_text(elf.header(symbol, n, a["program"]["count_states"], a["program"]["count_obs"],
                                                       elf.stack_bytes(a, n), f"{prog.process} {prog.colour}"))
+    return path
+
+
+def compile_simd_mixed(path, prog: Lowered, lanes: Optional[Sequence[int]] = None):
+    """compile_simd(precision = "mixed")"""
+    import symjit
+    from ..simd import downgrade, elf
+    lanes = tuple(host_lanes() if lanes is None else lanes)
+    if 4 not in lanes:
+        raise SimdError("device simd needs an x86-64 CPU with AVX2 and FMA to build on (symjit's JIT compiles the kernels)")
+    path = Path(path)
+    path.mkdir(parents=True, exist_ok=True)
+    a = MixedAssembler(prog)
+    app = a.assemble()
+    elf.no_relocations(app["mir"]["code"])
+    text = json.dumps(app)
+    (path / "kernel.json").write_text(text)
+    (path / "kernel_roles.json").write_text(json.dumps(a.roles))
+    (path / "runner.h").write_text(runner_h(prog, lanes, mixed=True))
+    codes = {}
+    for n in lanes:          # n: the f64 kernel's lanes; its f32 twin has 2 n
+        b = json.loads(text)
+        b["program"]["config"]["options"]["enable_simd512"] = n == 8
+        f = symjit.load_json(json.dumps(b))
+        f.dump(str(path / f"kernel{n}.bin"), "simd")
+        code = (path / f"kernel{n}.bin").read_bytes()
+        (path / f"kernel{n}.bin").unlink()
+        codes[n] = code
+        if n == 8 and code == codes.get(4):
+            raise SimdError("symjit compiled no AVX-512 kernel on this CPU")
+        code32 = downgrade.downgrade(code, consts=b["mir"]["consts"], roles=a.roles)
+        symbol = f"pac_simd{2 * n}"
+        (path / f"kernel{2 * n}.o").write_bytes(elf.elf_object(symbol, code32))
+        (path / f"kernel{2 * n}.h").write_text(elf.header(
+            symbol, 2 * n, b["program"]["count_states"], b["program"]["count_obs"], elf.stack_bytes(b, n),
+            f"{prog.process} {prog.colour}, mixed f32/df64 (float columns: element idx at byte 8 idx, call with idx / 2)"))
     return path

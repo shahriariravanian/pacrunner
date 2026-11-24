@@ -49,8 +49,8 @@ def compile_target(device: str, precision: str = "f64") -> tuple[str, str]:
         return name, "mixed"
     if name == "simd" and not simd_machine():
         raise PacRunnerError(f"device {device!r}: x86-64 only (AVX2 and AVX-512 kernels; this is {platform.machine()})")
-    if precision != "f64" and name in ("cpu", "simd"):
-        raise PacRunnerError(f"precision {precision!r} needs a GPU device (cuda, cuda_provider, metal)")
+    if precision != "f64" and name == "cpu":
+        raise PacRunnerError(f"precision {precision!r} needs a GPU device (cuda, cuda_provider, metal) or simd")
     return name, precision
 
 
