@@ -94,6 +94,25 @@ class Mir:
 
     def neg(self, a): return self.uni("Neg", a)
     def sqrt(self, a): return self.uni("Root", a)
+    def sign(self, a): return self.uni("Sign", a)              # the sign bit (x And -0.0)
+
+    # masks: all bits set (true) or none, per lane
+    def lt(self, a, b): return self.bi("LittleThan", a, b)
+    def le(self, a, b): return self.bi("LittleThanEqual", a, b)
+    def gt(self, a, b): return self.bi("GreaterThan", a, b)
+    def eq(self, a, b): return self.bi("Equal", a, b)
+    def ne(self, a, b): return self.bi("NotEqual", a, b)
+    def and_(self, a, b): return self.bi("And", a, b)
+    def or_(self, a, b): return self.bi("Or", a, b)
+    def xor(self, a, b): return self.bi("Xor", a, b)
+
+    def select(self, mask: Val, t: Val, f: Val) -> Val:
+        """t where mask is set, else f (symjit's IfElse: the mask in a Stack slot)"""
+        if t == f:
+            return t
+        v = self._new()
+        self.ops.append(_Op("ifelse", v, (mask, t, f)))
+        return v
 
     def output(self, k: int, v: Val) -> None:
         if not 0 <= k < self.n_out or k in self.saved:
@@ -105,8 +124,15 @@ class Mir:
     def fragment(self) -> dict:
         if self.saved != set(range(self.n_out)):
             raise ValueError(f"{self.name}: outputs {sorted(set(range(self.n_out)) - self.saved)} not written")
+        # dead values dropped: an op is kept when it stores an output or a kept op reads its value
+        live, kept = set(), []
+        for o in reversed(self.ops):
+            if o.kind == "save" or o.dst in live:
+                kept.append(o)
+                live.update(o.args)
+        ops = kept[::-1]
         uses: dict[Val, list[int]] = {}
-        for i, o in enumerate(self.ops):
+        for i, o in enumerate(ops):
             for a in o.args:
                 uses.setdefault(a, []).append(i)
         reg: dict[Val, int] = {}          # value -> Gen
@@ -159,20 +185,33 @@ class Mir:
             holder[g], reg[v] = v, g
             return g
 
-        for i, o in enumerate(self.ops):
+        def in_slot(v, i):
+            """v's Stack slot, saving it there first if it is only in a register"""
+            nonlocal nslots
+            if v not in slot:
+                if free_slots:
+                    s = free_slots.pop()
+                else:
+                    s, nslots = nslots, nslots + 1
+                slot[v] = s
+                code.append({"Save": {"loc": {"Stack": s}, "src": {"Gen": get(v, i, {v})}}})
+            return slot[v]
+
+        for i, o in enumerate(ops):
             keep = set(o.args)
-            srcs = [get(a, i, keep) for a in o.args]
-            for a in keep:                    # arguments read for the last time: their places are free
-                if next_use(a, i) is None:
+            cond = in_slot(o.args[0], i) if o.kind == "ifelse" else None
+            srcs = [get(a, i, keep) for a in (o.args[1:] if o.kind == "ifelse" else o.args)]
+            dead_slots = []
+            for a in keep:                    # arguments read for the last time: their registers are free
+                if next_use(a, i) is None:    # (the result may take one), their slots after the op
                     if a in reg:
                         del holder[reg.pop(a)]
                     if a in slot:
-                        free_slots.append(slot.pop(a))
+                        dead_slots.append(slot.pop(a))
             if o.kind == "save":
                 code.append({"Save": {"loc": {"Mem": o.loc}, "src": {"Gen": srcs[0]}}})
+                free_slots.extend(dead_slots)
                 continue
-            if next_use(o.dst, i) is None:
-                raise ValueError(f"{self.name}: value {o.dst.id} is never used")
             d = take(i, set())
             holder[d], reg[o.dst] = o.dst, d
             if o.kind == "load":
@@ -181,11 +220,15 @@ class Mir:
                 code.append({"LoadConst": {"dst": {"Gen": d}, "idx": o.loc}})
             elif o.kind == "bi":
                 code.append({"Bi": {"op": o.op, "dst": {"Gen": d}, "s1": {"Gen": srcs[0]}, "s2": {"Gen": srcs[1]}}})
+            elif o.kind == "ifelse":
+                code.append({"IfElse": {"dst": {"Gen": d}, "true_val": {"Gen": srcs[0]}, "false_val": {"Gen": srcs[1]},
+                                        "cond": {"Stack": cond}}})
             elif o.kind == "fused":
                 code.append({"Fused": {"op": o.op, "dst": {"Gen": d}, "a": {"Gen": srcs[0]}, "b": {"Gen": srcs[1]},
                                        "c": {"Gen": srcs[2]}}})
             else:
                 code.append({"Uni": {"op": o.op, "dst": {"Gen": d}, "s1": {"Gen": srcs[0]}}})
+            free_slots.extend(dead_slots)
         return {"format": "pacrunner-simd-fragment", "format_version": 1, "name": self.name, "symjit_version": None,
                 "inputs": self.inputs, "outputs": self.n_out, "count_stack": nslots + 2, "consts": self.consts,
                 "code": code}
@@ -265,3 +308,74 @@ class DD:
         pi_h = m.sub(x.hi, r.hi)
         delta = m.add(pi_h, m.sub(x.lo, r.lo))
         return self.fast_two_sum(th, m.div(delta, y.hi))
+
+
+class DDX(DD):
+    """DD with df64.h's comparisons, selects and the functions the wavefunctions use (masks per lane:
+    df64.h's branches become selects, both sides computed)"""
+
+    def zero(self) -> dd:
+        return self.exact(0.0)
+
+    def select(self, mask: Val, x: dd, y: dd) -> dd:
+        return dd(self.m.select(mask, x.hi, y.hi), self.m.select(mask, x.lo, y.lo))
+
+    # comparisons (hi decides, lo breaks ties)
+    def lt(self, a: dd, b: dd) -> Val:
+        m = self.m
+        return m.or_(m.lt(a.hi, b.hi), m.and_(m.eq(a.hi, b.hi), m.lt(a.lo, b.lo)))
+
+    def le(self, a: dd, b: dd) -> Val:
+        m = self.m
+        return m.or_(m.lt(a.hi, b.hi), m.and_(m.eq(a.hi, b.hi), m.le(a.lo, b.lo)))
+
+    def gt(self, a: dd, b: dd) -> Val:
+        return self.lt(b, a)
+
+    def ne(self, a: dd, b: dd) -> Val:
+        m = self.m
+        return m.or_(m.ne(a.hi, b.hi), m.ne(a.lo, b.lo))
+
+    def is_zero(self, x: dd) -> Val:
+        m = self.m
+        z = m.const(0.0)
+        return m.and_(m.eq(x.hi, z), m.eq(x.lo, z))
+
+    def isnan(self, x: dd) -> Val:
+        m = self.m
+        return m.or_(m.ne(x.hi, x.hi), m.ne(x.lo, x.lo))
+
+    def signbit_mask(self, x: dd) -> Val:
+        """dd_signbit as a mask, for a number (not NaN): hi < 0, or hi = -0 (1 / hi < 0)"""
+        m = self.m
+        z = m.const(0.0)
+        return m.or_(m.lt(x.hi, z), m.and_(m.eq(x.hi, z), m.lt(m.div(m.const(1.0), x.hi), z)))
+
+    # sign-bit operations: exact, as df64.h's negations
+    def abs(self, x: dd) -> dd:
+        s = self.m.sign(x.hi)
+        return dd(self.m.xor(x.hi, s), self.m.xor(x.lo, s))
+
+    def copysign(self, x: dd, s: dd) -> dd:
+        m = self.m
+        d = m.xor(m.sign(x.hi), m.sign(s.hi))
+        return dd(m.xor(x.hi, d), m.xor(x.lo, d))
+
+    def sqrt(self, x: dd) -> dd:
+        """Karp-Markstein: one correction of the plain root; (sqrt(hi), 0) where hi > 0 does not hold"""
+        m = self.m
+        s = m.sqrt(x.hi)
+        r = self.sub(x, self.two_prod(s, s))
+        good = self.fast_two_sum(s, m.div(r.hi, m.mul(m.const(2.0), s)))
+        return self.select(m.gt(x.hi, m.const(0.0)), good, dd(s, m.const(0.0)))
+
+    def max(self, x: dd, y: dd) -> dd:
+        """Julia's max (NaN propagates as x + y; max(-0, 0) = 0)"""
+        tie = self.select(self.signbit_mask(x), y, x)
+        r = self.select(self.ne(x, y), self.select(self.gt(x, y), x, y), tie)
+        return self.select(self.m.or_(self.isnan(x), self.isnan(y)), self.add(x, y), r)
+
+    def min(self, x: dd, y: dd) -> dd:
+        tie = self.select(self.signbit_mask(x), x, y)
+        r = self.select(self.ne(x, y), self.select(self.lt(x, y), x, y), tie)
+        return self.select(self.m.or_(self.isnan(x), self.isnan(y)), self.add(x, y), r)

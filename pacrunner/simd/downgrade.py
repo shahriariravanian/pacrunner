@@ -24,9 +24,11 @@ The rewrite, per instruction (anything else symjit's kernels do not contain, and
     vector its lanes); a NaN pattern (the masks: all ones, 0x7fff...) keeps its high 32 bits in both
     halves. A double that has no float (out of range) is an error.
 
-The data area starts at the lowest address an instruction reads RIP-relative: symjit puts it after the
-code, and its kernels load every constant they keep (checked against the assembler's @data label on
-70 kernels, plans/sjb2asm). The kernels call no functions (simd/elf.py refuses them).
+The data area: symjit puts the constant pool (all of the MIR's constants, in order) first after the code,
+then its own tables. Given the pool, its start is the first instruction boundary where the pool's bytes
+begin; without it, the lowest address an instruction reads RIP-relative (right when the first constants are
+read: checked against the assembler's @data label on 70 kernels, plans/sjb2asm). The kernels call no
+functions (simd/elf.py refuses them).
 
 The caller passes the columns as floats: the kernel reads element `idx` of a state at byte 8 x idx,
 so an f32 kernel is called with idx / 2 (the points are a multiple of 8 or 16, so idx is even).
@@ -193,8 +195,24 @@ def decode(code: bytes, end: int) -> list[Ins]:
     return out
 
 
-def data_start(code: bytes) -> int:
-    """the lowest address an instruction reads RIP-relative, decoding until it is reached"""
+def data_start(code: bytes, consts: Optional[list] = None) -> int:
+    """Where the data area starts. With the kernel's constant pool (`consts`: the MIR's constants in
+    order, as "0x..." bit strings; the JIT puts them first in the data area, every one of them, used or
+    not): the first instruction boundary, decoding from the start, where the pool's bytes begin (not
+    past the lowest address the code reads).
+    Without: the lowest address an instruction reads RIP-relative (wrong if the first constants are
+    never read)."""
+    if consts:
+        pool = struct.pack(f"<{len(consts)}Q", *(int(c, 16) for c in consts))
+        pc, lowest = 0, len(code)
+        while pc <= min(lowest, len(code) - len(pool)):
+            if code[pc:pc + len(pool)] == pool:      # an instruction boundary where the pool begins
+                return pc
+            ins = decode_one(code, pc)
+            if ins.rip is not None:
+                lowest = min(lowest, ins.rip)
+            pc += ins.length
+        raise DowngradeError("the constant pool is not in the code's data area")
     pc, lowest = 0, len(code)
     while pc < min(lowest, len(code)):
         ins = decode_one(code, pc)
@@ -309,10 +327,10 @@ def rewrite_code(code: bytes, end: Optional[int] = None, stats: Optional[dict] =
     return out
 
 
-def downgrade(code: bytes, stats: Optional[dict] = None) -> bytes:
-    """the f32 twin of an f64 SIMD kernel's machine code (`dump(.., "simd")`); `stats` collects the
-    counts of what was rewritten"""
-    start = data_start(code)
+def downgrade(code: bytes, stats: Optional[dict] = None, consts: Optional[list] = None) -> bytes:
+    """the f32 twin of an f64 SIMD kernel's machine code (`dump(.., "simd")`); `consts`: the kernel's
+    constant pool (its MIR's, data_start); `stats` collects the counts of what was rewritten"""
+    start = data_start(code, consts)
     if start % 8 or len(code) % 8:
         raise DowngradeError(f"the data area (0x{start:x}..0x{len(code):x}) is not in 8-byte units")
     out = rewrite_code(code, start, stats)

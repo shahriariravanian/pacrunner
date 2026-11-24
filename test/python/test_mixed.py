@@ -5,7 +5,12 @@ CPU has it, AVX-512), downgraded to f32 + df64 (simd/downgrade.py) and run on ra
 outputs must be the Metal sources' (c/metal/pacops.metal through msl_shim.h, test/metal_shim_ops.cpp,
 without flushing denormals: the CPU keeps them) bit for bit.
 
-  Propagators  propagator:<weyl_a|weyl_b|vector>:mixed against shim_propagator
+  Vertices       the shipped f64 vertex fragments (vertex:<kind>:<set|add>), downgraded, against
+                 shim_vertex's o × s (+ the old current): Metal's vertex row, s = rmul(coupling, factor)
+                 folded in f32 as the Metal runner computes it (the f64 fragments need no mixed twin)
+  Propagators    propagator:<weyl_a|weyl_b|vector>:mixed against shim_propagator
+  Wavefunctions  wave:<scalar|weyl|dirac|gluon|massive_vector>:...:mixed against shim_wavefunction, on
+                 random momenta and the branches' edges (E < 0, on the z axis, pz = 0, at rest)
 
 Skipped without symjit >= 2.29, a C++ compiler (CXX, default c++) or an x86-64 CPU with AVX2.
 
@@ -67,8 +72,38 @@ def todd(x: float) -> tuple[float, float]:
     return float(h), float(f32(x - float(h)))
 
 
-@unittest.skipUnless(HAVE_SYMJIT and HAVE_CXX and 4 in host_lanes(), "no symjit >= 2.29, C++ compiler or AVX2")
-class Propagators(unittest.TestCase):
+def rmul(a, b):
+    """pacops.metal's rmul in f32: (a.re b.re - a.im b.im, a.re b.im + a.im b.re), no contraction"""
+    return (f32(a[0]) * f32(b[0]) - f32(a[1]) * f32(b[1]), f32(a[0]) * f32(b[1]) + f32(a[1]) * f32(b[0]))
+
+
+def floats(rng, n, scale=1.0):
+    return [float(f32(x)) for x in rng.standard_normal(n) * scale]
+
+
+def momenta(rng, n, mass=0.0):
+    """n momenta (E, px, py, pz): random, and the wavefunctions' edges"""
+    out = []
+    for i in range(n):
+        p = rng.standard_normal(3) * 200
+        e = float(np.sqrt(p @ p + mass * mass))
+        if i % 7 == 1:
+            p[:2] = 0.0                              # on the z axis
+        if i % 7 == 2:
+            p[:2] = 0.0
+            p[2] = -abs(p[2])
+        if i % 7 == 3:
+            p[:] = 0.0                               # at rest (pt = pp = 0)
+            e = mass or 1.0
+        if i % 7 == 4:
+            p[2] = 0.0
+        if i % 2 == 1:
+            e, p = -e, -p                            # E < 0 (crossed legs)
+        out.append([e, *p])
+    return out
+
+
+class _Shim(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.tmp = tempfile.TemporaryDirectory()
@@ -82,6 +117,104 @@ class Propagators(unittest.TestCase):
     def tearDownClass(cls):
         cls.tmp.cleanup()
 
+    def run_f32(self, frag, rows, lanes):
+        """the fragment downgraded, on rows of inputs (a multiple of 2 lanes): its outputs as floats"""
+        code32 = D.downgrade(simd_code(frag, lanes, self.tmp.name), consts=frag["consts"])
+        return Machine(code32).run(np.array(rows), frag["outputs"], 2 * lanes, np.float32).astype(np.float32)
+
+
+@unittest.skipUnless(HAVE_SYMJIT and HAVE_CXX and 4 in host_lanes(), "no symjit >= 2.29, C++ compiler or AVX2")
+class Vertices(_Shim):
+    def test_f64_vertices_downgraded_are_the_metal_runners_bits(self):
+        from pacrunner.simd.library import VERTICES, fragment
+        rng = np.random.default_rng(5)
+        types = {"weyl_vector_a": 0, "weyl_vector_b": 1, "tensor_vector": 2, "vector_wedge": 3, "three_vector": 4}
+        for kind, (nl, nr, no) in VERTICES.items():
+            for mode in ("set", "add"):
+                frag = fragment(f"vertex:{kind}:{mode}")
+                for lanes in host_lanes():
+                    with self.subTest(kind=kind, mode=mode, lanes=lanes):
+                        rows, want = [], []
+                        for _ in range(16 * lanes):
+                            l, r = floats(rng, 2 * nl), floats(rng, 2 * nr)
+                            u, v = floats(rng, 4, 100), floats(rng, 4, 100)
+                            scale, factor = floats(rng, 2), floats(rng, 2)
+                            s = [float(x) for x in rmul(scale, factor)]
+                            old = floats(rng, 2 * no)
+                            o = (ctypes.c_double * 12)()
+                            self.shim.shim_vertex(o, types[kind], (ctypes.c_double * 12)(*l, *[0.0] * (12 - 2 * nl)),
+                                                  (ctypes.c_double * 12)(*r, *[0.0] * (12 - 2 * nr)),
+                                                  (ctypes.c_double * 4)(*u), (ctypes.c_double * 4)(*v))
+                            w = []
+                            for j in range(no):
+                                c = rmul((o[2 * j], o[2 * j + 1]), s)
+                                if mode == "add":
+                                    c = (f32(old[2 * j]) + c[0], f32(old[2 * j + 1]) + c[1])
+                                w += [c[0], c[1]]
+                            values = {"two": 2.0, "s.re": s[0], "s.im": s[1]}
+                            for j in range(nl):
+                                values[f"l{j}.re"], values[f"l{j}.im"] = l[2 * j], l[2 * j + 1]
+                            for j in range(nr):
+                                values[f"r{j}.re"], values[f"r{j}.im"] = r[2 * j], r[2 * j + 1]
+                            for j in range(no):
+                                values[f"old{j}.re"], values[f"old{j}.im"] = old[2 * j], old[2 * j + 1]
+                            for j in range(4):
+                                values[f"u{j}"], values[f"v{j}"] = u[j], v[j]
+                            rows.append([values[n] for n in frag["inputs"]])
+                            want.append(w)
+                        want = np.array(want, dtype=np.float32)
+                        got = self.run_f32(frag, rows, lanes)
+                        differ = int((got.view(np.uint32) != want.view(np.uint32)).sum())
+                        self.assertEqual(differ, 0, f"{differ} of {want.size} values differ")
+
+
+@unittest.skipUnless(HAVE_SYMJIT and HAVE_CXX and 4 in host_lanes(), "no symjit >= 2.29, C++ compiler or AVX2")
+class Wavefunctions(_Shim):
+    CASES = ([("scalar", 0, 0, 0, 0, False)]
+             + [("weyl", 1, a, h, ch, False) for a in (0, 1) for h in (1, -1) for ch in (1, -1)]
+             + [("dirac", 2, a, h, 0, massive) for a in (0, 1) for h in (1, -1) for massive in (False, True)]
+             + [("gluon", 3, 0, h, 0, False) for h in (1, -1)]
+             + [("massive_vector", 3, 0, h, 0, True) for h in (1, 0, -1)])
+
+    @staticmethod
+    def frag(kind, anti, h, ch, massive):
+        side = "anti" if anti else "part"
+        if kind == "scalar":
+            return mixed.wave_scalar()
+        if kind == "weyl":
+            return mixed.wave_weyl(bool(anti), h, ch)
+        if kind == "dirac":
+            return mixed.wave_dirac_massive(bool(anti), h) if massive else mixed.wave_dirac_massless(bool(anti), h)
+        if kind == "gluon":
+            return mixed.wave_gluon(h)
+        return mixed.wave_massive_vector(h)
+
+    def test_wavefunctions_are_the_metal_runners_bits(self):
+        rng = np.random.default_rng(11)
+        for kind, family, anti, h, ch, massive in self.CASES:
+            frag = self.frag(kind, anti, h, ch, massive)
+            n = frag["outputs"] // 4
+            for lanes in host_lanes():
+                with self.subTest(fragment=frag["name"], lanes=lanes):
+                    mass = 91.188 if kind == "massive_vector" else 4.7 if massive else 0.0
+                    rows, want = [], []
+                    for k in momenta(rng, 16 * lanes, mass):
+                        out = (ctypes.c_double * 8)()
+                        got_n = self.shim.shim_wavefunction(out, family, anti, (ctypes.c_double * 4)(*k), h, ch,
+                                                            ctypes.c_double(mass))
+                        self.assertEqual(got_n, n)
+                        rows.append([y for x in k for y in todd(x)] + (list(todd(mass)) if "mass.hi" in frag["inputs"] else []))
+                        want.append(list(out)[:2 * n])
+                    got = self.run_f32(frag, rows, lanes).astype(np.float64)
+                    value = got[:, 0::2] + got[:, 1::2]          # hi + lo per (re, im)
+                    want = np.array(want)
+                    same = (value == want) | (np.isnan(value) & np.isnan(want))
+                    self.assertTrue(same.all(), f"{int((~same).sum())} of {same.size} values differ: "
+                                                f"{value[~same.all(axis=1)][:2]} vs {want[~same.all(axis=1)][:2]}")
+
+
+@unittest.skipUnless(HAVE_SYMJIT and HAVE_CXX and 4 in host_lanes(), "no symjit >= 2.29, C++ compiler or AVX2")
+class Propagators(_Shim):
     def test_propagators_are_the_metal_runners_bits(self):
         rng = np.random.default_rng(3)
         for kind in PROPAGATOR:
@@ -89,7 +222,7 @@ class Propagators(unittest.TestCase):
             n = 4 if kind == "vector" else 2
             for lanes in host_lanes():
                 with self.subTest(kind=kind, lanes=lanes):
-                    code32 = D.downgrade(simd_code(frag, lanes, self.tmp.name))
+                    code32 = D.downgrade(simd_code(frag, lanes, self.tmp.name), consts=frag["consts"])
                     rows, want = [], []
                     for _ in range(16 * lanes):
                         c = [float(f32(x)) for x in rng.standard_normal(2 * n)]

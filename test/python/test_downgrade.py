@@ -173,10 +173,11 @@ class Kernels(unittest.TestCase):
                         f.dump(os.path.join(d, "k.bin"), "simd")
                         with open(os.path.join(d, "k.bin"), "rb") as fb:
                             code = fb.read()
-                        start = D.data_start(code)
+                        start = D.data_start(code, app["mir"]["consts"])
+                        self.assertEqual(D.data_start(code), start)
                         self.assertEqual(sum(i.length for i in D.decode(code, start)), start)
                         stats = {}
-                        code32 = D.downgrade(code, stats)
+                        code32 = D.downgrade(code, stats, consts=app["mir"]["consts"])
                         self.assertGreater(stats["ps"], 0)
                         # whole calls: the reference points repeated to 2 x 2 lanes
                         X = np.resize(pts, (4 * lanes, pts.shape[1]))
