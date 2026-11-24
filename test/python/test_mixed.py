@@ -13,9 +13,10 @@ without flushing denormals: the CPU keeps them) bit for bit.
                  random momenta and the branches' edges (E < 0, on the z axis, pz = 0, at rest)
   Programs       whole programs (compile_simd.MixedAssembler, downgraded with its roles) against the
                  program's runner.metal on the CPU (compile_metal, test/metal_shim_run.cpp with
-                 -DSHIM_KEEP_DENORMALS), bit for bit: per golden export without model kernels, sampled
-                 programs as exported and with a leg permutation (a crossing), at the export's reference
-                 points; and the matrix element against RustiCol's within mixed precision's target
+                 -DSHIM_KEEP_DENORMALS), bit for bit: per golden export, sampled programs (model kernels
+                 included: simd/mixed_kernel.py) as exported and with a leg permutation (a crossing), at
+                 the export's reference points; and the matrix element against RustiCol's within mixed
+                 precision's target
 
 Skipped without symjit >= 2.29, a C++ compiler (CXX, default c++) or an x86-64 CPU with AVX2.
 
@@ -36,7 +37,6 @@ from goldens import ROOT, golden_sets
 
 from pacrunner import codegen, kernels, uir, umami
 from pacrunner.codegen.compile_simd import MixedAssembler, host_lanes
-from pacrunner.uir.types import is_kernel
 from pacrunner.simd import downgrade as D
 from pacrunner.simd import library, mixed
 from test_downgrade import Machine
@@ -288,7 +288,7 @@ class Programs(unittest.TestCase):
         checked = 0
         for name, export in SETS:
             ls, refs = uir.load_recurrence_export(export), uir.recurrence_references(export)
-            cand = [k for k, l in enumerate(ls) if refs[k] is not None and not any(is_kernel(o.op) for o in l.ops)]
+            cand = [k for k, l in enumerate(ls) if refs[k] is not None]
             if not cand:
                 continue
             for k in sorted({cand[int(i)] for i in np.linspace(0, len(cand) - 1, self.PER)}):
@@ -323,7 +323,7 @@ class Programs(unittest.TestCase):
                                 self.assertLess(float(np.max(np.abs(me / ref - 1))), 1e-5)
                         checked += 1
         if not checked:
-            self.skipTest("no golden program without model kernels")
+            self.skipTest("no golden program")
 
 
 if __name__ == "__main__":

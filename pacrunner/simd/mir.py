@@ -20,6 +20,8 @@ from dataclasses import dataclass
 from typing import Optional
 
 GENS = 14
+SPILL_BASE = 80     # a fragment's own Stack slots: from 80, after the compress-mode argument area Stack(16 ..
+                    # 16 + 64) (as symjit's fragments: compile_simd's T)
 
 
 def bits(x: float) -> str:
@@ -172,7 +174,7 @@ class Mir:
                 else:
                     s, nslots = nslots, nslots + 1
                 slot[v] = s
-                code.append({"Save": {"loc": {"Stack": s}, "src": {"Gen": gv}}})
+                code.append({"Save": {"loc": {"Stack": SPILL_BASE + s}, "src": {"Gen": gv}}})
             return gv
 
         def get(v, i, keep):
@@ -181,7 +183,7 @@ class Mir:
             if v not in slot:
                 raise ValueError(f"{self.name}: value {v.id} used before it is defined")
             g = take(i, keep)
-            code.append({"Load": {"dst": {"Gen": g}, "loc": {"Stack": slot[v]}}})
+            code.append({"Load": {"dst": {"Gen": g}, "loc": {"Stack": SPILL_BASE + slot[v]}}})
             holder[g], reg[v] = v, g
             return g
 
@@ -194,7 +196,7 @@ class Mir:
                 else:
                     s, nslots = nslots, nslots + 1
                 slot[v] = s
-                code.append({"Save": {"loc": {"Stack": s}, "src": {"Gen": get(v, i, {v})}}})
+                code.append({"Save": {"loc": {"Stack": SPILL_BASE + s}, "src": {"Gen": get(v, i, {v})}}})
             return slot[v]
 
         for i, o in enumerate(ops):
@@ -222,7 +224,7 @@ class Mir:
                 code.append({"Bi": {"op": o.op, "dst": {"Gen": d}, "s1": {"Gen": srcs[0]}, "s2": {"Gen": srcs[1]}}})
             elif o.kind == "ifelse":
                 code.append({"IfElse": {"dst": {"Gen": d}, "true_val": {"Gen": srcs[0]}, "false_val": {"Gen": srcs[1]},
-                                        "cond": {"Stack": cond}}})
+                                        "cond": {"Stack": SPILL_BASE + cond}}})
             elif o.kind == "fused":
                 code.append({"Fused": {"op": o.op, "dst": {"Gen": d}, "a": {"Gen": srcs[0]}, "b": {"Gen": srcs[1]},
                                        "c": {"Gen": srcs[2]}}})
@@ -230,7 +232,7 @@ class Mir:
                 code.append({"Uni": {"op": o.op, "dst": {"Gen": d}, "s1": {"Gen": srcs[0]}}})
             free_slots.extend(dead_slots)
         return {"format": "pacrunner-simd-fragment", "format_version": 1, "name": self.name, "symjit_version": None,
-                "inputs": self.inputs, "outputs": self.n_out, "count_stack": nslots + 2, "consts": self.consts,
+                "inputs": self.inputs, "outputs": self.n_out, "count_stack": SPILL_BASE + nslots + 2, "consts": self.consts,
                 "code": code}
 
 

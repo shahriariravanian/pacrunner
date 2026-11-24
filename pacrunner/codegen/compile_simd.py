@@ -791,6 +791,11 @@ def dd(x: float) -> tuple:
     return DDC("hi", x), DDC("lo", x)
 
 
+def mixed_called(name: str) -> bool:
+    """the mixed kernels' subroutines: called()'s, and the dd row fragments kout, cmul_round, closure"""
+    return called(name) or name.startswith(("kout:", "cmul_round:", "closure:"))
+
+
 class MixedAssembler(Assembler):
     """the mixed kernel (plans/F32-KERNEL.md): the Metal runner's uir_run (c/metal/uirvm.metal) as an
     f64 + double-double kernel, which simd/downgrade.py turns into its f32 + df64 twin, bit for bit the
@@ -798,13 +803,13 @@ class MixedAssembler(Assembler):
     hi parts, then lo parts (Mem 8 legs + h, + outputs). The forms and amplitudes are dd: their hi parts in
     the arena, their lo parts after it ("extra"), then the forms rounded (the three-vector vertex's). The
     rows' f32 constants are folded as the Metal runner computes them (rmul32 of rf), its df64 tables are dd
-    constants (DDC), its roles in `roles`. Not yet: model kernels."""
+    constants (DDC), its roles in `roles`. Model kernels: simd/mixed_kernel.py (kernel_msl's typing)."""
 
-    def __init__(self, prog: Lowered, call=called):
-        super().__init__(prog, call)
-        for op in prog.ops:
-            if is_kernel(op.op):
-                raise SimdError("the mixed kernels do not support model kernels yet")
+    def __init__(self, prog: Lowered, call=None):
+        # the dd row arithmetic (a kernel row's outputs, a source's components, closures) as subroutines
+        # too: each is a few hundred MIR, inlined per row it would dominate the kernel's code
+        super().__init__(prog, call or mixed_called)
+        self.kwide = {}          # a mixed kernel fragment's wide constants, in its w<i> order
         F, A = len(prog.forms), prog.amplitudes
         self.nlo = 4 * F + 2 * A
         self.extra = self.nlo + 4 * F
@@ -837,7 +842,16 @@ class MixedAssembler(Assembler):
     def frag(self, name):
         if name.endswith(":mixed"):
             if name not in self.frags:
-                self.frags[name] = mixed_fragments.fragment(name)
+                if name.startswith("kernel:"):
+                    from ..simd import mixed_kernel
+                    from .common import kernel_info
+                    sha = name.split(":")[1]
+                    k = next(s.kernel for s in self.prog.stubs if s.kernel.sha256 == sha)
+                    info = kernel_info(k)
+                    self.frags[name], self.kwide[name] = mixed_kernel.kernel_fragment(
+                        k.name, info.mir, info.inputs, info.outputs)
+                else:
+                    self.frags[name] = mixed_fragments.fragment(name)
             return self.frags[name]
         return super().frag(name)
 
@@ -850,6 +864,8 @@ class MixedAssembler(Assembler):
             return f"closure:{n}:mixed" if n else None
         if o == Opcode.SOURCE:
             return self.wave_name(op)
+        if is_kernel(o):
+            return f"kernel:{p.stubs[p.instances[op.t][0]].kernel.sha256}:mixed"
         return super().frag_name(op)
 
     def wave_name(self, op):
@@ -873,6 +889,7 @@ class MixedAssembler(Assembler):
         p = self.prog
         names = {self.frag_name(op) for op in p.ops} | {self.form_name(f) for f in p.forms}
         names |= {"cmul_round:mixed", "reduce:plain:mixed", "reduce:scaled:mixed", "group:mixed"}
+        names |= {f"kout:{a}:{b}:mixed" for a in ("direct", "scaled") for b in ("set", "add")}
         return sorted(n for n in names if n)
 
     def amp_inputs(self, a):
@@ -964,6 +981,47 @@ class MixedAssembler(Assembler):
             self.inline(f"reduce:{'plain' if op.x is None else 'scaled'}:mixed", ins, [self.out(op.d), self.out_lo(op.d)])
         else:
             super().row(op)
+
+    def kernel_row(self, op, name):
+        """uir_stub: the stub's inputs as df64 (planes widened exactly, forms, scales and the factor as the
+        df64 tables), the kernel (mixed_kernel), each output pair through uir_output (kout)"""
+        p, o = self.prog, op.op
+        (s, set_) = p.instances[op.t]
+        stub = p.stubs[s]
+        scaleset = p.scalesets[set_]
+        d = self.frag(name)
+        ins = {}
+        for k, i in enumerate(stub.inputs):
+            im = 1 if i.im else 0
+            if i.kind in (InputKind.IN_L, InputKind.IN_R, InputKind.OUT):
+                e = {InputKind.IN_L: op.l, InputKind.IN_R: op.r, InputKind.OUT: op.d}[i.kind]
+                ins[f"x{k}.hi"], ins[f"x{k}.lo"] = ("arena", self.b.edge_at(p, e) + 2 * i.n + im), 0.0
+            elif i.kind in (InputKind.MOMENTUM_U, InputKind.MOMENTUM_V):
+                f = p.edge_form(op.l if i.kind == InputKind.MOMENTUM_U else op.r)
+                ins[f"x{k}.hi"], ins[f"x{k}.lo"] = self.form(f, i.n), self.form_lo(f, i.n)
+            elif i.kind == InputKind.SCALE:
+                ins[f"x{k}.hi"], ins[f"x{k}.lo"] = dd(float(p.scales[scaleset[i.n]].real))
+            else:                            # FACTOR
+                z = p.factors[op.x]
+                ins[f"x{k}.hi"], ins[f"x{k}.lo"] = dd(float(z.imag if im else z.real))
+        for w, x in enumerate(self.kwide[name]):
+            ins[f"w{w}.hi"], ins[f"w{w}.lo"] = dd(x)
+        n_out = d["outputs"]                  # hi, lo of each output value
+        res = [("scratch", j) for j in range(n_out)]
+        self.scratch_used = max(self.scratch_used, n_out)
+        self.inline(name, {n: ins[n] for n in d["inputs"]}, res)
+        scaled = o != Opcode.KERNEL_DIRECT
+        mode = "set" if op.set else "add"
+        z = p.factors[op.x]
+        for n, comp in enumerate(stub.outputs):
+            c = {"p.re.hi": res[4 * n], "p.re.lo": res[4 * n + 1], "p.im.hi": res[4 * n + 2], "p.im.lo": res[4 * n + 3]}
+            if scaled:
+                c["f.re.hi"], c["f.re.lo"] = dd(z.real)
+                c["f.im.hi"], c["f.im.lo"] = dd(z.imag)
+            dre, dim = self.edge(op.d, comp)
+            if mode == "add":
+                c["old.re"], c["old.im"] = dre, dim
+            self.inline(f"kout:{'scaled' if scaled else 'direct'}:{mode}:mixed", c, [dre, dim])
 
     def row_factor(self, x) -> complex:
         """the Metal runner's f32 copy of the factor (rfactor): the f64 rows' MIR, which the downgrade makes

@@ -406,6 +406,8 @@ def fragment(name: str) -> dict:
         return reduce(p[1] == "scaled")
     if p[0] == "group":
         return group()
+    if p[0] == "kout":
+        return kout(p[1] == "scaled", p[2] == "add")
     if p[0] == "wave":
         if p[1] == "scalar":
             return wave_scalar()
@@ -419,3 +421,21 @@ def fragment(name: str) -> dict:
         if p[1] == "massive_vector":
             return wave_massive_vector(int(p[2]))
     raise ValueError(f"no mixed fragment {name!r}")
+
+
+def kout(scaled: bool, add: bool) -> dict:
+    """kout:<direct|scaled>:<set|add>:mixed: a kernel row's output pair into its component (uirvm.metal
+    uir_output): the pair (dd) × the row's factor (dd) unless direct, added to the old component widened
+    (add), rounded once into the plane"""
+    names = ["p.re", "p.im"] + (["f.re", "f.im"] if scaled else [])
+    inputs = _dd_inputs(names) + (["old.re", "old.im"] if add else [])
+    m = Mir(inputs, 2, f"kout:{'scaled' if scaled else 'direct'}:{'add' if add else 'set'}:mixed")
+    d = DD(m)
+    v = (d.input("p.re"), d.input("p.im"))
+    if scaled:
+        v = _cmul(d, v, (d.input("f.re"), d.input("f.im")))
+    if add:
+        v = (d.add(d.of(m.input("old.re")), v[0]), d.add(d.of(m.input("old.im")), v[1]))
+    m.output(0, d.to_plain(v[0]))
+    m.output(1, d.to_plain(v[1]))
+    return m.fragment()
