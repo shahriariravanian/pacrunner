@@ -828,6 +828,26 @@ def runner_h(prog: Lowered, isa: str, split: bool = False) -> str:
 """
 
 
+# the instruction sets whose kernels call their subroutines in the plain convention (plain_calls)
+PLAIN_CALLS = {"neon"}
+
+
+def plain_calls(app: dict) -> dict:
+    """the application with its compress-mode calls in symjit's plain convention: ultra off, each LoadArgs
+    loading the argument values into vector registers, each Call to the body's plain entry (its SaveArgs
+    stores them to the argument area), instead of slot numbers packed 4 to an integer register. On aarch64
+    the packing costs a movz/movk per argument; plain calls run 7-11% fewer instructions, 1-3% faster on
+    the M4 (plans/pacrunner-python/F32-KERNEL.md)"""
+    a = json.loads(json.dumps(app))
+    a["program"]["config"]["options"]["ultra"] = False
+    for ins in a["mir"]["code"]:
+        if isinstance(ins, dict) and "LoadArgs" in ins:
+            ins["LoadArgs"]["ultra"] = False
+        if isinstance(ins, dict) and "Call" in ins and ins["Call"]["label"].endswith("_ultra"):
+            ins["Call"]["label"] = ins["Call"]["label"][:-len("_ultra")]
+    return a
+
+
 def jit_kernel(app: dict, isa: str, what: str, folder) -> bytes:
     """the SIMD kernel of `app` for `isa` from symjit's JIT: `dump(.., what)`, "simd" or "simd-f32" (its
     f32 twin: symjit >= 2.29.2)"""
@@ -861,6 +881,8 @@ def compile_simd(path, prog: Lowered, isa: Optional[str] = None, precision: str 
     path = Path(path)
     path.mkdir(parents=True, exist_ok=True)
     app, _ = simd_application(prog)
+    if isa in PLAIN_CALLS:
+        app = plain_calls(app)
     elf.no_relocations(app["mir"]["code"])
     (path / "kernel.json").write_text(json.dumps(app))
     (path / "runner.h").write_text(runner_h(prog, isa))
@@ -883,6 +905,8 @@ def compile_simd_split(path, prog: Lowered, isa: Optional[str] = None):
     path = Path(path)
     path.mkdir(parents=True, exist_ok=True)
     app_a, app_b, _, items = split_applications(prog)
+    if isa in PLAIN_CALLS:
+        app_a, app_b = plain_calls(app_a), plain_calls(app_b)
     for app in (app_a, app_b):
         elf.no_relocations(app["mir"]["code"])
     (path / "kernelA.json").write_text(json.dumps(app_a))
