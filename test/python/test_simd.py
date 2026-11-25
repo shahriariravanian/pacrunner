@@ -1,4 +1,4 @@
-"""device "simd": the library of pacops operations (pacrunner/simd/), compile_simd's kernels and the UMAMI
+"""The SIMD devices (simd-avx2, simd-avx512, simd-neon; "simd" this machine's): the library of pacops operations (pacrunner/simd/), compile_simd's kernels and the UMAMI
 libraries built from them.
 
   Library   every fragment of the catalogue shipped and readable; fragments compiled again by this symjit
@@ -7,11 +7,12 @@ libraries built from them.
             crossing): the kernel (symjit's JIT, scalar and SIMD) against the straight-line C runner
             (codegen.compile, cc), bit for bit, on the export's reference points and random momenta
             (both signs of E, beams on the z axis)
-  Umami     the simd libraries of small providers against the cpu ones through the UMAMI API (ctypes),
-            bit for bit: drawn and fixed helicities, 4 and 8 lanes (as the CPU has them), several chunks,
-            an offset and a stride
-  Objects   the object files (simd/elf.py): their .text is symjit's JIT code, no relocations, the symbol;
-            a kernel calling a function refused
+  Umami     the libraries of small providers on every SIMD device of this machine against the cpu ones
+            through the UMAMI API (ctypes), bit for bit: drawn and fixed helicities, several chunks, an
+            offset and a stride
+  Objects   the object files (simd/elf.py): their code is symjit's JIT code (x86-64: an ELF object with no
+            relocations and the symbol; aarch64: the bytes an assembler file includes); a kernel calling a
+            function refused
   Units     the device's checks
 
 Skipped without the corpus (goldens), symjit >= 2.29, cc, or (Umami, Objects) an x86-64 CPU with AVX2.
@@ -36,7 +37,7 @@ from goldens import golden_sets
 
 from pacrunner import _env, codegen, kernels, uir, umami
 from pacrunner.codegen.common import ArenaIndex
-from pacrunner.codegen.compile_simd import Assembler, SimdError, host_lanes, simd_application
+from pacrunner.codegen.compile_simd import ISAS, LANES, Assembler, SimdError, simd_application
 from pacrunner.simd import elf, library
 
 HAVE_SYMJIT = kernels.symjit_problem() is None
@@ -96,10 +97,11 @@ class Library(unittest.TestCase):
 
     @unittest.skipUnless(HAVE_SYMJIT, "no symjit >= 2.29")
     def test_compiled_again(self):
-        from importlib.metadata import version
         names = ["vertex:three_vector:add", "propagator:weyl_a", "closure:4", "wave:massive_vector:0",
                  "wave:dirac:anti:1:massive"]
-        if library.fragment(names[0])["symjit_version"] != version("symjit"):
+        # the symjit that compiles now (its own version, not the installed distribution's: a symjit on
+        # PYTHONPATH may be another)
+        if library.compile_fragment(names[0])[0]["symjit_version"] != library.fragment(names[0])["symjit_version"]:
             self.skipTest("the library was written by another symjit")
         for name in names:
             with self.subTest(name=name):
@@ -187,22 +189,10 @@ class Library_(object):
         self.so.umami_free(self.handle)
 
 
-def simd_cpu() -> list:
-    """the lane counts this CPU runs (4: AVX2 and FMA, 8: AVX-512 F and DQ)"""
-    try:
-        flags = Path("/proc/cpuinfo").read_text()
-    except OSError:
-        return []
-    out = []
-    if " avx2" in flags and " fma" in flags:
-        out.append(4)
-    if " avx512f" in flags and " avx512dq" in flags:
-        out.append(8)
-    return out
+DEVICES = _env.simd_devices()   # this machine's SIMD devices
 
 
-@unittest.skipUnless(SETS and HAVE_SYMJIT and HAVE_CC and _env.simd_machine() and 4 in host_lanes(),
-                     "no corpus, symjit >= 2.29, cc, or x86-64 with AVX2")
+@unittest.skipUnless(SETS and HAVE_SYMJIT and HAVE_CC and DEVICES, "no corpus, symjit >= 2.29, cc, or a SIMD device")
 class Umami(unittest.TestCase):
     def test_simd_libraries_are_the_cpu_ones(self):
         rng = np.random.default_rng(11)
@@ -212,10 +202,10 @@ class Umami(unittest.TestCase):
             export, m = SETS[name]
             with tempfile.TemporaryDirectory() as out:
                 tables = {}
-                for device in ("cpu", "simd"):
+                for device in ("cpu", *DEVICES):
                     path = umami.umami_libraries(export, m["metadata"], Path(out) / device, device=device, quiet=True)
                     tables[device] = json.loads(Path(path).read_text())
-                self.assertEqual(tables["simd"]["device"], "simd")
+                    self.assertEqual(tables[device]["device"], device)
                 meta = json.loads(Path(m["metadata"]).read_text())
                 helicities = len(meta["helicities"])
                 for k, entry in enumerate(tables["cpu"]["libraries"]):
@@ -228,10 +218,9 @@ class Umami(unittest.TestCase):
                     cpu = Library_(Path(out) / "cpu" / entry["path"])
                     want = [cpu.call(p, random=random), cpu.call(p, fixed=fixed)]
                     cpu.close()
-                    for lanes in simd_cpu():
-                        with self.subTest(export=name, library=k, lanes=lanes), \
-                                mock.patch.dict(os.environ, {"PAC_SIMD_LANES": str(lanes)}):
-                            simd = Library_(Path(out) / "simd" / tables["simd"]["libraries"][k]["path"])
+                    for device in DEVICES:
+                        with self.subTest(export=name, library=k, device=device):
+                            simd = Library_(Path(out) / device / tables[device]["libraries"][k]["path"])
                             got = [simd.call(p, random=random), simd.call(p, fixed=fixed)]
                             simd.close()
                             for (g, w) in zip(got, want):
@@ -240,88 +229,97 @@ class Umami(unittest.TestCase):
                                 self.assertTrue(np.array_equal(g[2], w[2]))
 
 
-@unittest.skipUnless(SETS and HAVE_SYMJIT and _env.simd_machine() and 4 in host_lanes(),
-                     "no corpus, symjit >= 2.29, or x86-64 with AVX2")
+@unittest.skipUnless(SETS and HAVE_SYMJIT and DEVICES, "no corpus, symjit >= 2.29, or a SIMD device")
 class Objects(unittest.TestCase):
     def test_objects_hold_the_jit_code(self):
         import symjit
         export, m = SETS["zgg"]
         prog = uir.optimize(uir.load_recurrence_export(export)[0])
-        with tempfile.TemporaryDirectory() as d:
-            codegen.compile_simd(d, prog)
-            app = json.loads((Path(d) / "kernel.json").read_text())
-            for n in host_lanes():
-                with self.subTest(lanes=n):
-                    obj = (Path(d) / f"kernel{n}.o").read_bytes()
-                    a = json.loads(json.dumps(app))
-                    a["program"]["config"]["options"]["enable_simd512"] = n == 8
-                    symjit.load_json(json.dumps(a)).dump(str(Path(d) / "jit.bin"), "simd")
-                    jit = (Path(d) / "jit.bin").read_bytes()
+        for device in DEVICES:
+            isa, n = ISAS[device], LANES[ISAS[device]]
+            with self.subTest(device=device), tempfile.TemporaryDirectory() as d:
+                codegen.compile_simd(d, prog, isa=isa)
+                app = json.loads((Path(d) / "kernel.json").read_text())
+                a = json.loads(json.dumps(app))
+                a["program"]["config"]["options"]["enable_simd512"] = isa == "avx512"
+                symjit.load_json(json.dumps(a)).dump(str(Path(d) / "jit.bin"), "simd")
+                jit = (Path(d) / "jit.bin").read_bytes()
+                if isa == "neon":
+                    self.assertEqual((Path(d) / "kernel.bin").read_bytes(), jit)
+                    src = (Path(d) / "kernel.S").read_text()
+                    self.assertIn(f'.incbin "{Path(d).resolve() / "kernel.bin"}"', src)
+                    self.assertIn(".p2align 12", src)
+                else:
+                    obj = (Path(d) / "kernel.o").read_bytes()
                     self.assertEqual(obj[4096:4096 + len(jit)], jit)   # .text at 4096: the ELF writer's layout
-                    h = (Path(d) / f"kernel{n}.h").read_text()
-                    self.assertIn(f"#define PAC_SIMD{n}_LANES {n}", h)
-                    self.assertGreater(int(re.search(rf"PAC_SIMD{n}_STACK_BYTES (\d+)", h).group(1)),
-                                       (app["program"]["builder"]["count_stack"]) * 8 * n)
                     if shutil.which("readelf"):
-                        r = subprocess.run(["readelf", "-rsW", str(Path(d) / f"kernel{n}.o")], capture_output=True, text=True)
+                        r = subprocess.run(["readelf", "-rsW", str(Path(d) / "kernel.o")], capture_output=True, text=True)
                         self.assertIn("There are no relocations", r.stdout)
-                        self.assertRegex(r.stdout, rf"FUNC +GLOBAL +DEFAULT +1 pac_simd{n}")
-            self.assertEqual((8 in host_lanes()), "PAC_SIMD_HAVE8" in (Path(d) / "runner.h").read_text())
+                        self.assertRegex(r.stdout, r"FUNC +GLOBAL +DEFAULT +1 pac_kernel")
+                h = (Path(d) / "kernel.h").read_text()
+                self.assertIn(f"#define PAC_KERNEL_LANES {n}", h)
+                self.assertGreater(int(re.search(r"PAC_KERNEL_STACK_BYTES (\d+)", h).group(1)),
+                                   app["program"]["builder"]["count_stack"] * 8 * n)
+                self.assertIn(f"#define PAC_SIMD_ISA_{isa.upper()} 1", (Path(d) / "runner.h").read_text())
 
-
-    def test_a_library_built_without_avx512(self):
-        """built as on a CPU without AVX-512: kernel4.o only, no PAC_SIMD_HAVE8; the cpu library's bits"""
-        import importlib
-        cs = importlib.import_module("pacrunner.codegen.compile_simd")   # the function shadows the module
+    def test_another_machine_s_device_is_refused(self):
         export, m = SETS["zgg"]
-        rng = np.random.default_rng(5)
-        with tempfile.TemporaryDirectory() as out:
-            cpu = json.loads(Path(umami.umami_libraries(export, m["metadata"], Path(out) / "cpu", quiet=True)).read_text())
-            with mock.patch.object(cs, "host_lanes", lambda: (4,)):
-                simd = json.loads(Path(umami.umami_libraries(export, m["metadata"], Path(out) / "simd", device="simd",
-                                                             quiet=True)).read_text())
-            folder = Path(out) / "simd" / Path(simd["libraries"][0]["path"]).parent
-            self.assertFalse((folder / "kernel8.o").exists())
-            self.assertNotIn("PAC_SIMD_HAVE8", (folder / "runner.h").read_text())
-            n = int(cpu["particle_count"])
-            p3 = rng.uniform(-300, 300, (37, n, 3))
-            p = np.concatenate([np.linalg.norm(p3, axis=2)[:, :, None], p3], axis=2)
-            random = rng.uniform(0, 1, 37)
-            a = Library_(Path(out) / "cpu" / cpu["libraries"][0]["path"])
-            want = a.call(p, random=random)
-            a.close()
-            for lanes in ("", "8"):   # PAC_SIMD_LANES=8 is refused (no such kernel), else AVX2
-                with mock.patch.dict(os.environ, {"PAC_SIMD_LANES": lanes} if lanes else {}):
-                    if lanes == "8":
-                        with self.assertRaises(RuntimeError):
-                            Library_(Path(out) / "simd" / simd["libraries"][0]["path"])
-                        continue
-                    b = Library_(Path(out) / "simd" / simd["libraries"][0]["path"])
-                    got = b.call(p, random=random)
-                    b.close()
-                    self.assertTrue(np.array_equal(got[0].view(np.uint64), want[0].view(np.uint64)))
-                    self.assertTrue(np.array_equal(got[2], want[2]))
+        other = [d for d in _env.SIMD_DEVICES if d not in DEVICES]
+        prog = uir.optimize(uir.load_recurrence_export(export)[0])
+        for device in other:
+            with self.subTest(device=device), tempfile.TemporaryDirectory() as d:
+                with self.assertRaisesRegex(SimdError, "to build on"):
+                    codegen.compile_simd(d, prog, isa=ISAS[device])
+                with self.assertRaisesRegex(umami.UmamiError, "does not build on this machine"):
+                    umami.umami_libraries(export, m["metadata"], d, device=device, quiet=True)
 
 
 class Units(unittest.TestCase):
+    def machine(self, machine, flags=""):
+        """this machine as another: platform.machine() and /proc/cpuinfo's flags"""
+        return mock.patch.multiple(_env, platform=mock.Mock(machine=lambda: machine),
+                                   _cpu_flags=lambda: set(flags.split()))
+
     def test_devices(self):
-        self.assertEqual(_env.device_name("simd"), "simd")
-        with mock.patch.object(_env.platform, "machine", lambda: "x86_64"):
-            self.assertEqual(_env.compile_target("simd"), ("simd", "f64"))
-            self.assertEqual(_env.compile_target("simd", "mixed"), ("simd", "mixed"))   # the split kernels (f64 + f32)
+        with self.machine("x86_64", "sse avx2 fma avx512f avx512dq"):
+            self.assertEqual(_env.simd_devices(), ("simd-avx2", "simd-avx512"))
+            self.assertEqual(_env.device_name("simd"), "simd-avx512")
+            self.assertEqual(_env.compile_target("simd"), ("simd-avx512", "f64"))
+            self.assertEqual(_env.compile_target("simd-split"), ("simd-avx512", "split"))
+            self.assertEqual(_env.compile_target("simd", "split"), ("simd-avx512", "split"))
+            self.assertEqual(_env.compile_target("simd-avx2-split"), ("simd-avx2", "split"))
+            self.assertEqual(_env.compile_target("simd-avx2", "mixed"), ("simd-avx2", "split"))   # the former name
+            self.assertEqual(_env.library_name("simd-split"), "simd-avx512-split")
+            self.assertEqual(_env.library_name("simd-avx2"), "simd-avx2")
+            with self.assertRaisesRegex(_env.PacRunnerError, "does not build on this machine"):
+                _env.compile_target("simd-neon")
+            with self.assertRaisesRegex(_env.PacRunnerError, "needs a SIMD device"):
+                _env.compile_target("cpu", "split")
+            with self.assertRaisesRegex(_env.PacRunnerError, "needs a SIMD device"):
+                _env.compile_target("cuda", "split")
             with self.assertRaisesRegex(_env.PacRunnerError, "needs a GPU device"):
                 _env.compile_target("cpu", "mixed")
-        with mock.patch.object(_env.platform, "machine", lambda: "arm64"):
-            with self.assertRaisesRegex(_env.PacRunnerError, "x86-64 only"):
+        with self.machine("x86_64", "sse avx2 fma"):
+            self.assertEqual(_env.device_name("simd"), "simd-avx2")
+            with self.assertRaisesRegex(_env.PacRunnerError, "does not build on this machine"):
+                _env.compile_target("simd-avx512")
+        for arm in ("aarch64", "arm64"):
+            with self.machine(arm):
+                self.assertEqual(_env.compile_target("simd-split"), ("simd-neon", "split"))
+                self.assertEqual(_env.library_name("simd-neon-split"), "simd-neon-split")
+                with self.assertRaisesRegex(_env.PacRunnerError, "does not build on this machine"):
+                    _env.compile_target("simd-avx2")
+        with self.machine("riscv64"):
+            self.assertEqual(_env.simd_devices(), ())
+            with self.assertRaisesRegex(_env.PacRunnerError, "device 'simd'"):
                 _env.compile_target("simd")
 
-    def test_simd_needs_avx2_to_build(self):
+    def test_simd_needs_a_simd_device(self):
         if not (SETS and HAVE_SYMJIT):
             self.skipTest("no corpus or symjit >= 2.29")
         export, m = SETS["zgg"]
-        with mock.patch.object(umami, "host_lanes", lambda: ()), \
-                mock.patch.object(umami._env, "simd_machine", lambda: True), tempfile.TemporaryDirectory() as out:
-            with self.assertRaisesRegex(umami.UmamiError, "AVX2"):
+        with self.machine("riscv64"), tempfile.TemporaryDirectory() as out:
+            with self.assertRaisesRegex(umami.UmamiError, "device 'simd'"):
                 umami.umami_libraries(export, m["metadata"], out, device="simd", quiet=True)
 
     def test_calls_are_refused(self):
@@ -333,8 +331,12 @@ class Units(unittest.TestCase):
 
     def test_folder_names(self):
         from pacrunner._mad import library_folder_name
-        with mock.patch.object(_env.platform, "machine", lambda: "x86_64"):
-            self.assertEqual(library_folder_name("simd"), "pacrunner-simd")
+        with self.machine("x86_64", "avx2 fma avx512f avx512dq"):
+            self.assertEqual(library_folder_name("simd"), "pacrunner-simd-avx512")
+            self.assertEqual(library_folder_name("simd", "split"), "pacrunner-simd-avx512-split")
+            self.assertEqual(library_folder_name("simd-avx2-split"), "pacrunner-simd-avx2-split")
+        with self.machine("aarch64"):
+            self.assertEqual(library_folder_name("simd-split"), "pacrunner-simd-neon-split")
 
 
 if __name__ == "__main__":

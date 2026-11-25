@@ -104,28 +104,38 @@ following operations:
 
 We will discuss the files in the source folder below.
 
-On x86-64, `compile(device="simd")` builds a faster CPU provider: each program becomes one symjit kernel
-(PacRunner's library of the UIR operations in `pacrunner/simd/`, spliced by `codegen/compile_simd.py`), compiled
-by symjit's JIT into an AVX2 kernel (4 events per call) and, where the building CPU has AVX-512, an AVX-512 kernel
-(8 events per call); PacRunner writes their machine code as object files (`pacrunner/simd/elf.py`: the kernels call
-no functions, so they need no relocations) and links them with the UMAMI layer. The library uses the kernel the CPU it
-runs on supports (`PAC_SIMD_LANES=4` asks for AVX2). Its values are the `cpu` provider's bit for bit; it needs
+The SIMD devices build a faster CPU provider: each program becomes one symjit kernel (PacRunner's library of
+the UIR operations in `pacrunner/simd/`, spliced by `codegen/compile_simd.py`), compiled by symjit's JIT for one
+instruction set:
+
+| Device | Machine | Events per kernel call (f64 / split) |
+|---|---|---|
+| `simd-avx2` | x86-64 with AVX2 and FMA | 4 / 8 |
+| `simd-avx512` | x86-64 with AVX-512 (F, DQ) | 8 / 16 |
+| `simd-neon` | aarch64 (Linux, macOS) | 2 / 4 |
+
+`simd` is this machine's: `simd-avx512` where the CPU has AVX-512, else `simd-avx2`, and `simd-neon` on
+aarch64. A SIMD device builds on a machine whose CPU runs it (symjit's JIT compiles the kernels for it), and its
+library checks the CPU when it loads. PacRunner writes the machine code as object files (`pacrunner/simd/elf.py`:
+an ELF object on x86-64, an assembler file on aarch64; the kernels call no functions, so they need no
+relocations) and links them with the UMAMI layer. The values are the `cpu` provider's bit for bit; it needs
 nothing beyond symjit and `cc`.
 
 ```python
-provider_simd = a.compile(device="simd")    # PacRunner's SIMD provider on the CPU (x86-64)
+provider_simd = a.compile(device="simd")    # PacRunner's SIMD provider on the CPU
 rt_simd = provider_simd.runtime(0)
 print(rt_simd(batch, 0).matrix_element)     # should print [2.43239313e-05], as the cpu provider
 ```
 
-`compile(device="simd", precision="mixed")` runs each program as two kernels: kernel A in f64 computes what
-needs f64 from the momenta (the forms, `1/k²` of the propagators, the sources' wavefunctions, the wide parts of
-the model kernels: their denominators `k² − M²`), rounded to f32; kernel B computes the rest (vertices,
-propagators, model kernels, amplitudes, the reduction) in f32 at twice the lanes (8 with AVX2, 16 with
-AVX-512; `PAC_SIMD_LANES=8` asks for AVX2). Kernel B is symjit's f64 kernel rewritten instruction by
-instruction to f32 (`pacrunner/simd/downgrade.py`); `codegen/compile_split.py` splits the program.
-The matrix element is within about 1e-6 of f64, and 1.2–1.9× faster than `simd` in f64 (more with model
-kernels and many propagators).
+`compile(device="simd", precision="split")` (or the device names `simd-split`, `simd-avx2-split`,
+`simd-avx512-split`, `simd-neon-split`) runs each program as two kernels: kernel A in f64 computes what needs
+f64 from the momenta (the forms, `1/k²` of the propagators, the sources' wavefunctions, the wide parts of the
+model kernels: their denominators `k² − M²`), rounded to f32; kernel B computes the rest (vertices, propagators,
+model kernels, amplitudes, the reduction) in f32 at twice the lanes. Kernel B is symjit's f32 twin of its f64
+kernel (`dump(.., "simd-f32")`: the machine code rewritten instruction by instruction, symjit >= 2.29.2);
+`codegen/compile_split.py` splits the program. The matrix element is within about 1e-6 of f64, and 1.2–1.9×
+faster than f64 on x86-64 (more with model kernels and many propagators). The precision's former name, `mixed`,
+is accepted on a SIMD device.
 
 For now, let's continue with generating CUDA providers. 
 PacRunner currently supports two types of GPU backend: `compile(device="cuda")` and `compile(device="cuda_provider")`
@@ -286,8 +296,8 @@ MadSpace's threads.
 | `cuda_full` | mixed | 0.254\* | 0.091\* | — |
 
 - Wall times: the fastest of 3 untimed runs (RTX 5060, H100); one untimed run after a warm-up (M4).
-- `simd`: one symjit kernel per program, 8 events per call with AVX-512 and 4 with AVX2 (`PAC_SIMD_LANES=4`); the
-  `cpu` provider's bits (the events of the two runs are identical); x86-64 only. RTX 5060 machine: the fastest
+- `simd`: one symjit kernel per program, 8 events per call with AVX-512 (`simd-avx512`) and 4 with AVX2
+  (`simd-avx2`); the `cpu` provider's bits (the events of the two runs are identical). RTX 5060 machine: the fastest
   of 2 runs, measured beside a fresh `cpu` run (44.7 s, 23.6 µs/pt); H100 machine: from the CPU benchmark below.
 - `gpu` is CUDA on the RTX 5060 and H100, Metal on the M4 (mixed precision only; no `cuda_full`
   counterpart).

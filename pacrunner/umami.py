@@ -23,10 +23,12 @@ device "metal" (macOS): the program runs on an Apple GPU (the UIR interpreter in
 f32/df64: Metal has no f64), the library a CPU provider (c/metal/umami_metal.c: the inputs and each
 event's end on the host in f64, one GPU run per call); one slot pool per process, libpacmetal.dylib.
 device "gpu": this system's GPU with MadSpace on the CPU, metal on macOS and cuda elsewhere.
-device "simd" (x86-64): the program as one symjit kernel (codegen.compile_simd: the library of pacops
-operations spliced; symjit's AVX2 kernel, and its AVX-512 one where the building CPU has AVX-512, as object
-files), 4 or 8 events per kernel call; the library a CPU provider with the CPU build's bits (umami_pac.c,
-PAC_SIMD).
+devices "simd-avx2", "simd-avx512" (x86-64), "simd-neon" (aarch64), and "simd" (this machine's: simd-avx512
+where the CPU has AVX-512, else simd-avx2; simd-neon on aarch64): the program as one symjit kernel
+(codegen.compile_simd: the library of pacops operations spliced; symjit's kernel for the instruction set as
+an object file), 4, 8 or 2 events per kernel call; the library a CPU provider with the CPU build's bits
+(umami_pac.c, PAC_SIMD). precision "split" (a SIMD device; "simd-avx2-split" and so on): the split kernels,
+kernel A in f64 and kernel B in f32 (symjit's f32 twin, twice the lanes).
 
 The programs come from RustiCol's recurrence export (uir.load_recurrence_export) of the same artifact,
 with the same model parameters: a library refuses other values (umami_set_parameter).
@@ -51,7 +53,7 @@ from typing import Optional, Sequence, Union
 from . import _env, codegen, kernels, uir
 from ._literal import julia_repr
 from .codegen.common import C_DIR, cstring
-from .codegen.compile_simd import host_lanes
+from .codegen.compile_simd import ISAS
 from .codegen.compile_vm import GPU_MEMORY_DEFAULT
 from .uir import Lowered
 
@@ -60,6 +62,7 @@ DEVICES = _env.DEVICES                        # cuda: on the GPU, a CPU provider
 DEVICE_ALIASES = _env.DEVICE_ALIASES          # cuda_full: all on the GPU (MadSpace's GPU runtime)
 PRECISIONS = _env.PRECISIONS                  # a CUDA device: mixed is pacops.h's PAC_MIXED
 GPU_DEVICES = ("cuda", "cuda_provider", "metal")
+SIMD_DEVICES = tuple(_env.SIMD_DEVICES)
 SO = "dylib" if sys.platform == "darwin" else "so"
 
 Flags = Union[str, Sequence[str]]
@@ -297,14 +300,12 @@ def build_umami_metal(dir, lib: UmamiLibrary, l: Lowered, provider: dict, export
 
 
 def build_umami_simd(dir, lib: UmamiLibrary, l: Lowered, provider: dict, exported_count: int, parameters, *,
-                     cc: Optional[str] = None, cflags: Flags = ("-O2",), precision: str = "f64") -> str:
-    """build_umami_library for device "simd" (x86-64): compile_simd's folder (the permutation folded into the
-    crossing; kernel4.o, the AVX2 kernel, and kernel8.o, the AVX-512 one, where this CPU has AVX-512) and
-    umami_pac.c with PAC_SIMD, linked with only the UMAMI functions exported. precision "mixed": the split
-    kernels (kernel A in f64, kernel B in f32: kernelA4.o + kernelB8.o AVX2, kernelA8.o + kernelB16.o
-    AVX-512) and PAC_SIMD_SPLIT"""
-    if not _env.simd_machine():
-        raise UmamiError("device simd: x86-64 only (AVX2 and AVX-512 kernels)")
+                     cc: Optional[str] = None, cflags: Flags = ("-O2",), device: str = "simd-avx2",
+                     precision: str = "f64") -> str:
+    """build_umami_library for a SIMD device (simd-avx2, simd-avx512, simd-neon): compile_simd's folder for its
+    instruction set (the permutation folded into the crossing; the kernel as kernel.o, x86-64, or kernel.S,
+    aarch64) and umami_pac.c with PAC_SIMD, linked with only the UMAMI functions exported. precision "split":
+    the split kernels (kernelA, kernelB) and PAC_SIMD_SPLIT"""
     if int(provider["particle_count"]) != l.legs:
         raise UmamiError(f"{lib.process} {lib.colour}: the provider has {provider['particle_count']} particles, "
                          f"the program {l.legs} legs")
@@ -312,7 +313,7 @@ def build_umami_simd(dir, lib: UmamiLibrary, l: Lowered, provider: dict, exporte
     dir = Path(dir)
     l = permuted(l, lib.permutation)   # the library reads the caller's legs
     try:
-        codegen.compile_simd(dir, l, precision=precision)
+        codegen.compile_simd(dir, l, isa=ISAS[device], precision=precision)
     except codegen.CompileError as e:
         raise UmamiError(f"{lib.process} {lib.colour}: {e}") from e
     (tables, program) = umami_program_h(lib, l, provider, exported_count, parameters)
@@ -324,9 +325,11 @@ def build_umami_simd(dir, lib: UmamiLibrary, l: Lowered, provider: dict, exporte
     exports.write_text("{ global: umami_*; local: *; };\n")
     hide = [f"-Wl,--version-script={exports}"] if sys.platform.startswith("linux") else []
     so = dir / f"libumami_pac.{SO}"
-    names = ("kernelA4", "kernelB8", "kernelA8", "kernelB16") if precision == "mixed" else ("kernel4", "kernel8")
-    objects = [dir / f"{n}.o" for n in names if (dir / f"{n}.o").is_file()]
-    flag = ["-DPAC_SIMD_SPLIT"] if precision == "mixed" else []
+    stems = ("kernelA", "kernelB") if precision == "split" else ("kernel",)
+    objects = [dir / f"{n}{ext}" for n in stems for ext in (".o", ".S") if (dir / f"{n}{ext}").is_file()]
+    if len(objects) != len(stems):
+        raise UmamiError(f"{lib.process} {lib.colour}: compile_simd wrote no kernel objects in {dir}")
+    flag = ["-DPAC_SIMD_SPLIT"] if precision == "split" else []
     _run([*cc, *_flags(cflags), "-std=c99", "-ffp-contract=off", "-fPIC", "-fvisibility=hidden", "-DPAC_SIMD",
           *flag, "-shared", *hide, "-o", so, dir / "umami_pac.c", *objects, "-lm"])
     return str(so)
@@ -345,18 +348,17 @@ def build_umami_library(dir, lib: UmamiLibrary, l: Lowered, provider: dict, expo
     CPU) of `gpu_memory` device bytes each (a call needing more runs as several launches). precision
     "mixed" (a CUDA device only): pacops.h's PAC_MIXED, not the CPU's bits, so nvcc may contract
     multiply-adds unless fmad = False. device "metal" (macOS): build_umami_metal (always mixed f32/df64).
-    device "simd" (x86-64): build_umami_simd."""
-    device = device_name(device)
-    if device not in DEVICES:
-        raise UmamiError(f"device {device}: one of {DEVICES} (or {', '.join(DEVICE_ALIASES)}, gpu)")
-    if precision not in PRECISIONS:
-        raise UmamiError(f"precision {precision}: one of {PRECISIONS}")
+    a SIMD device (simd-avx2, simd-avx512, simd-neon; precision f64 or split): build_umami_simd."""
+    try:
+        device, precision = _env.compile_target(device, precision)
+    except _env.PacRunnerError as e:
+        raise UmamiError(str(e)) from e
     if device == "metal":
         return build_umami_metal(dir, lib, l, provider, exported_count, parameters, cc=cc, cflags=cflags,
                                  runtime_dir=runtime_dir)
-    if device == "simd":
+    if device in SIMD_DEVICES:
         return build_umami_simd(dir, lib, l, provider, exported_count, parameters, cc=cc, cflags=cflags,
-                                precision=precision)
+                                device=device, precision=precision)
     fmad = precision == "mixed" if fmad is None else fmad
     cuda = device in ("cuda", "cuda_provider")
     provider_build = device == "cuda_provider"
@@ -502,29 +504,23 @@ def umami_libraries(export, metadata, dir, *, optimize_programs: bool = True, in
     (macOS): each program on an Apple GPU through Metal (c/metal/), always in mixed f32/df64 precision
     (`precision` is ignored), the libraries CPU providers; one slot pool per process
     (`dir/libpacmetal.dylib`; PAC_METAL_SLOTS, PAC_METAL_CHUNK, PAC_METAL_SLOT_BYTES). `device = "gpu"`:
-    metal on macOS, cuda elsewhere. `device = "simd"` (x86-64): each program as one symjit kernel, symjit's
-    AVX2 kernel (and its AVX-512 one where the building CPU has AVX-512) as object files, the CPU build's
-    bits; the library picks the kernel of the CPU it runs on (PAC_SIMD_LANES=4 or 8 asks for one). The libraries are built in parallel (`jobs` at a time; default: the
-    CPUs)."""
-    device = device_name(device)
-    if device not in DEVICES:
-        raise UmamiError(f"device {device}: one of {DEVICES} (or {', '.join(DEVICE_ALIASES)}, gpu)")
-    if precision not in PRECISIONS:
-        raise UmamiError(f"precision {precision}: one of {PRECISIONS}")
+    metal on macOS, cuda elsewhere. A SIMD device, `device = "simd-avx2"`, `"simd-avx512"` (x86-64) or
+    `"simd-neon"` (aarch64), or `"simd"` (this machine's): each program as one symjit kernel for that
+    instruction set as an object file, the CPU build's bits; precision "split" (or a device name ending
+    in -split): the split kernels, f64 and f32. The libraries are built in parallel (`jobs` at a time;
+    default: the CPUs)."""
     if device == "metal":
         _require_macos()
-        precision = "mixed"   # Metal has no f64: always mixed f32/df64
-    if precision != "f64" and device not in GPU_DEVICES + ("simd",):
-        raise UmamiError(f"precision = {precision} needs device = cuda, cuda_provider, metal or simd")
-    fmad = (precision == "mixed" and device not in ("metal", "simd")) if fmad is None else fmad
-    if fmad and precision == "f64":
+    try:
+        device, precision = _env.compile_target(device, precision)   # metal: always mixed f32/df64
+    except _env.PacRunnerError as e:
+        raise UmamiError(str(e)) from e
+    if precision == "mixed" and device not in GPU_DEVICES:
+        raise UmamiError(f"precision = {precision} needs device = cuda, cuda_provider or metal")
+    fmad = (precision == "mixed" and device != "metal") if fmad is None else fmad
+    if fmad and precision != "mixed":
         raise UmamiError("fmad = True is not the CPU's bits: precision = mixed only")
     kernels.require_symjit()   # symjit >= 2.29 (the kernels' MIR), before any work
-    if device == "simd":
-        if not _env.simd_machine():
-            raise UmamiError("device simd: x86-64 only (AVX2 and AVX-512 kernels)")
-        if 4 not in host_lanes():
-            raise UmamiError("device simd needs an x86-64 CPU with AVX2 and FMA to build on (symjit compiles the kernels)")
     export_path = os.path.abspath(export) if isinstance(export, (str, os.PathLike)) else None   # or an export already read
     d = uir.read_export(export)
     meta = read_metadata(metadata, d)
@@ -587,8 +583,12 @@ def main(argv=None) -> int:
     ap.add_argument("export")
     ap.add_argument("metadata")
     ap.add_argument("dir")
-    ap.add_argument("--device", default="cpu", choices=DEVICES + tuple(DEVICE_ALIASES) + ("gpu",))
+    ap.add_argument("--device", default="cpu",
+                    help=f"one of {', '.join(DEVICES + tuple(DEVICE_ALIASES) + ('gpu',))}, or a SIMD device with -split")
     ap.add_argument("--precision", default="f64", choices=PRECISIONS)
+    ap.add_argument("--target", action="store_true",
+                    help="print the build's name for --device and --precision (a folder name: simd-avx512-split, "
+                         "cuda-mixed, ...) and exit; EXPORT, METADATA and DIR are then not needed")
     ap.add_argument("--interpreter", action="store_true", help="the UIR interpreter's data instead of straight-line C")
     ap.add_argument("--imported", action="store_true", help="the programs as imported (not optimized)")
     ap.add_argument("--quiet", action="store_true")
@@ -602,6 +602,18 @@ def main(argv=None) -> int:
     ap.add_argument("--gpu-memory", type=int, default=GPU_MEMORY_DEFAULT, help="the device bytes of a slot (or a launch)")
     ap.add_argument("--fmad", action=argparse.BooleanOptionalAction, default=None,
                     help="nvcc's contracted multiply-adds (default: with precision mixed only)")
+    if "--target" in (argv if argv is not None else sys.argv[1:]):
+        t = argparse.ArgumentParser(prog="python -m pacrunner.umami --target")
+        t.add_argument("--target", action="store_true")
+        t.add_argument("--device", default="cpu")
+        t.add_argument("--precision", default="f64")
+        a, _ = t.parse_known_args(argv)
+        try:
+            print(_env.library_name(a.device, a.precision))
+        except _env.PacRunnerError as e:
+            print(f"python -m pacrunner.umami: {e}", file=sys.stderr)
+            return 1
+        return 0
     a = ap.parse_args(argv)
     try:
         path = umami_libraries(a.export, a.metadata, a.dir, device=a.device, precision=a.precision, interpreter=a.interpreter,

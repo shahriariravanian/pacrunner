@@ -1,5 +1,5 @@
 """The split kernels (plans/F32-KERNEL.md, "Split kernels"): a program as two SIMD kernels, A in f64 and B
-in f32 (generated in f64 and downgraded by simd/downgrade.py), no double-double.
+in f32 (generated in f64 and turned into f32 by symjit, `dump(.., "simd-f32")`), no double-double.
 
   A (SplitA): states the momenta (Mem 4 leg + j); outputs the transfers, in order:
       the forms (4 per form);
@@ -15,10 +15,13 @@ split_applications(prog) -> (A's application, B's application, transfers: the de
 """
 from __future__ import annotations
 
+import math
+import struct
+
 from ..simd import split_kernel
 from ..simd.mir import Mir, Val
 from ..uir import InputKind, Lowered, Opcode, PhysicalType, is_kernel, is_propagator, is_vertex, source_fields
-from .compile_simd import PROPAGATOR, VERTEX, Assembler, called, fl32, library, rf, rmul32
+from .compile_simd import PROPAGATOR, VERTEX, Assembler, SimdError, called, fl32, library, rf, rmul32
 from .common import kernel_info
 
 
@@ -238,7 +241,7 @@ class SplitA(Assembler):
 
 
 class SplitB(Assembler):
-    """kernel B (f32 after the downgrade): the rows on the transfers, every constant folded in f32"""
+    """kernel B (f32: symjit's f32 twin of it): the rows on the transfers, every constant folded in f32"""
 
     def __init__(self, prog: Lowered, plan: Plan):
         super().__init__(prog, called)
@@ -424,10 +427,16 @@ class SplitB(Assembler):
 
 
 def split_applications(prog: Lowered):
-    """(A's application, B's application with its constants' roles, the transfers)"""
+    """(A's application, B's application, the B constants' f32 check, the transfers). symjit's f32
+    twin of B (`dump(.., "simd-f32")`) rounds its constants to f32: they are f32 values already (folded
+    in f32), checked here, so that the rounding changes none"""
     plan = Plan(prog)
     a = SplitA(prog, plan)
     app_a = a.assemble()
     b = SplitB(prog, plan)
     app_b = b.assemble()
-    return app_a, app_b, b.roles, plan.items
+    for c in app_b["mir"]["consts"]:
+        x = struct.unpack("<d", struct.pack("<Q", int(c, 16)))[0]
+        if math.isfinite(x) and fl32(x) != x:
+            raise SimdError(f"{prog.process} {prog.colour}: kernel B's constant {x!r} is not an f32 value")
+    return app_a, app_b, None, plan.items

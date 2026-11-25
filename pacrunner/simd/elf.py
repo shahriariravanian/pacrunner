@@ -1,5 +1,7 @@
 """The SIMD kernels as object files, without symjit-utils: symjit's own machine code (the JIT's SIMD
-kernel, `dump(path, "simd")`) wrapped in a minimal ELF64 relocatable object for x86-64, and its C header.
+kernel, `dump(path, "simd")` or its f32 twin `dump(path, "simd-f32")`) wrapped in a minimal ELF64
+relocatable object for x86-64 (elf_object), or for aarch64 in an assembler file that the C compiler
+assembles (asm_source: ELF on Linux, Mach-O on macOS), and its C header.
 
 This works because a kernel that calls no math function needs no relocation: the JIT's x86-64 code
 loads its constants RIP-relative from its own buffer, and its jumps and compress-mode calls are
@@ -9,6 +11,10 @@ function's address, which an object would have to relocate: refused (no_relocati
 
 The object: .text (the code, aligned to 4 KB as the JIT's buffer is), .note.GNU-stack (no executable
 stack), .symtab with one global function, the kernel, at offset 0, .strtab and .shstrtab.
+
+aarch64: the JIT's code reaches its constants with adrp (the 4 KB page of the instruction) + add, also
+position-independent as long as the code starts on a 4 KB boundary, as in the JIT's buffer: the
+assembler file aligns its section to 4 KB and includes the code's bytes (.incbin).
 """
 from __future__ import annotations
 
@@ -85,11 +91,54 @@ def elf_object(symbol: str, code: bytes) -> bytes:
     return bytes(out)
 
 
+def asm_source(symbol: str, binary: str) -> str:
+    """an assembler file (cc -c x.S) defining the hidden function `symbol` as the bytes of the file
+    `binary` (an absolute path), its section aligned to 4 KB: ELF (Linux) or Mach-O (macOS)"""
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", symbol):
+        raise ObjectError(f"{symbol!r} is not a C identifier")
+    if '"' in binary or "\n" in binary:
+        raise ObjectError(f"{binary!r}: a path the assembler cannot quote")
+    return f"""\
+/* {symbol}: symjit's machine code ({binary}), as PacRunner's simd/elf.py includes it */
+#if defined(__APPLE__)
+    .section __TEXT,__text,regular,pure_instructions
+    .p2align 12
+    .private_extern _{symbol}
+    .globl _{symbol}
+_{symbol}:
+    .incbin "{binary}"
+#else
+    .section .text.{symbol},"ax",%progbits
+    .p2align 12
+    .hidden {symbol}
+    .globl {symbol}
+    .type {symbol}, %function
+{symbol}:
+    .incbin "{binary}"
+    .size {symbol}, . - {symbol}
+    .section .note.GNU-stack,"",%progbits
+#endif
+"""
+
+
+def write_object(folder, stem: str, symbol: str, code: bytes, isa: str) -> str:
+    """the kernel `code` as `folder/stem.o` (x86-64: elf_object) or `folder/stem.S` (+ `stem.bin`; aarch64:
+    asm_source, assembled with the library); returns the file's name"""
+    from pathlib import Path
+    folder = Path(folder).resolve()
+    if isa == "neon":
+        (folder / f"{stem}.bin").write_bytes(code)
+        (folder / f"{stem}.S").write_text(asm_source(symbol, str(folder / f"{stem}.bin")))
+        return f"{stem}.S"
+    (folder / f"{stem}.o").write_bytes(elf_object(symbol, code))
+    return f"{stem}.o"
+
+
 def header(symbol: str, lanes: int, count_states: int, count_obs: int, stack: int, what: str) -> str:
     """the C header of a kernel object"""
     up = symbol.upper()
     return f"""\
-/* {symbol}: {what}, as an x86-64 object by PacRunner (symjit's SIMD kernel, simd/elf.py).
+/* {symbol}: {what}, as an object by PacRunner (symjit's SIMD kernel, simd/elf.py).
 
    A SIMD kernel of {lanes} lanes, indirect mode: `states` points to {up}_COUNT_STATES + {up}_COUNT_OBS
    arrays (symjit_slice: the states, then the outputs); {symbol}(NULL, states, i, NULL) reads elements

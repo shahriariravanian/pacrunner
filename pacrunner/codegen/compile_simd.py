@@ -70,11 +70,6 @@ def ckey(x) -> object:
     return bits(x)
 
 
-def role(x) -> list:
-    """a constant's role for the downgrade's check (a split kernel B's constants are already f32 values)"""
-    return ["plain"]
-
-
 def cmul(a: complex, b: complex) -> complex:
     """pacops mul(a, b) on doubles (Python floats are IEEE doubles, no fma)"""
     return complex(a.real * b.real - a.imag * b.imag, a.real * b.imag + a.imag * b.real)
@@ -179,7 +174,7 @@ class Assembler:
     def __init__(self, prog: Lowered, call=called):
         validate(prog)
         self.prog, self.b = prog, ArenaIndex.of(prog)
-        self.code, self.consts, self.cidx, self.roles = [], [], {}, []
+        self.code, self.consts, self.cidx = [], [], {}
         self.frags = {}
         self.rows_done = 0
         self.scratch_used = 0
@@ -197,7 +192,6 @@ class Assembler:
         if k not in self.cidx:
             self.cidx[k] = len(self.consts)
             self.consts.append(bits(x))
-            self.roles.append(role(x))
         return self.cidx[k]
 
     def count_states(self) -> int:
@@ -321,7 +315,6 @@ class Assembler:
             if c not in self.cidx:
                 self.cidx[c] = len(self.consts)
                 self.consts.append(c)
-                self.roles.append(["plain"])
             cmap[k] = self.cidx[c]
         prefix = prefix or f"r{self.rows_done}_"
         out, written = [], set()
@@ -783,33 +776,41 @@ def simd_application(prog: Lowered, call=called) -> tuple[dict, dict]:
 
 # ---- the folder --------------------------------------------------------------------------------------------
 
-def host_lanes() -> tuple[int, ...]:
-    """the lane counts symjit's JIT compiles on this machine: 4 (AVX2 and FMA), and 8 where the CPU has
-    AVX-512 (symjit's use_simd512 asks for avx512f)"""
-    try:
-        flags = set(Path("/proc/cpuinfo").read_text().split())
-    except OSError:
-        flags = set()
-    out = ()
-    if "avx2" in flags and "fma" in flags:
-        out += (4,)
-        if "avx512f" in flags and "avx512dq" in flags:
-            out += (8,)
-    return out
+ISAS = {"simd-avx2": "avx2", "simd-avx512": "avx512", "simd-neon": "neon"}   # device -> instruction set
+LANES = {"avx2": 4, "avx512": 8, "neon": 2}                                 # its f64 lanes
+NEEDS = {"avx2": "an x86-64 CPU with AVX2 and FMA", "avx512": "an x86-64 CPU with AVX-512 (F, DQ)",
+         "neon": "an aarch64 CPU"}
 
 
-def runner_h(prog: Lowered, lanes: Sequence[int], mixed: bool = False) -> str:
-    if mixed:      # the split kernels: A (f64) 4 / 8 lanes, B (f32) 8 / 16
-        have = "#define PAC_SIMD_SPLIT 1\n" + ("#define PAC_SIMD_HAVE16 1\n" if 8 in lanes else "")
-        what = "kernelA4.h, kernelB8.h: pac_split_a4, pac_split_b8, AVX2" \
-               f"{'; kernelA8.h, kernelB16.h: pac_split_a8, pac_split_b16, AVX-512' if 8 in lanes else ''}; A (f64): " \
-               "states the momenta, outputs the transfers; B (f32): states the transfers, outputs the helicity outputs"
+def host_isa() -> Optional[str]:
+    """the instruction set of this machine's SIMD device (_env.simd_device), or None"""
+    from .. import _env
+    d = _env.simd_device()
+    return ISAS[d] if d else None
+
+
+def _isa(isa: Optional[str]) -> str:
+    """`isa` (default host_isa()), checked against the SIMD devices this machine builds: symjit's JIT
+    compiles the kernels for its own CPU"""
+    from .. import _env
+    isa = isa or host_isa()
+    if isa not in LANES:
+        raise SimdError(f"no SIMD device on this machine ({', '.join(ISAS)}: {', '.join(NEEDS.values())})"
+                        if isa is None else f"instruction set {isa!r}: one of {', '.join(LANES)}")
+    if f"simd-{isa}" not in _env.simd_devices():
+        raise SimdError(f"device simd-{isa} needs {NEEDS[isa]} to build on (symjit's JIT compiles the kernels)")
+    return isa
+
+
+def runner_h(prog: Lowered, isa: str, split: bool = False) -> str:
+    n = LANES[isa]
+    if split:      # the split kernels: A (f64) n lanes, B (f32) 2 n
+        what = f"kernelA.h, kernelB.h: pac_kernel_a (f64, {n} lanes), pac_kernel_b (f32, {2 * n} lanes); A: states " \
+               "the momenta, outputs the transfers; B: states the transfers, outputs the helicity outputs"
     else:
-        have = "#define PAC_SIMD_HAVE8 1\n" if 8 in lanes else ""
-        what = f"kernel4.h: pac_simd4, AVX2{'; kernel8.h: pac_simd8, AVX-512' if 8 in lanes else ''}; states the " \
-               "momenta, outputs the helicity outputs"
+        what = f"kernel.h: pac_kernel ({n} lanes); states the momenta, outputs the helicity outputs"
     return f"""\
-/* {prog.process} {prog.colour}: the program as SIMD kernels, by PacRunner's compile_simd
+/* {prog.process} {prog.colour}: the program as SIMD kernels (simd-{isa}), by PacRunner's compile_simd
  * ({what}). */
 #ifndef RUNNER_H
 #define RUNNER_H
@@ -819,84 +820,81 @@ def runner_h(prog: Lowered, lanes: Sequence[int], mixed: bool = False) -> str:
 #define RUNNER_LEGS {prog.legs}
 #define RUNNER_OUTPUTS {prog.output_count()}
 #define RUNNER_ARENA_SIZE {ArenaIndex.of(prog).size}
-{have}
+#define PAC_SIMD_ISA_{isa.upper()} 1
+#define PAC_SIMD_DEVICE "simd-{isa}{'-split' if split else ''}"
+#define PAC_SIMD_NEEDS "{NEEDS[isa]}"
+{'#define PAC_SIMD_SPLIT 1' if split else ''}
 #endif
 """
 
 
-def compile_simd(path, prog: Lowered, lanes: Optional[Sequence[int]] = None, precision: str = "f64"):
-    """the folder of `prog` (see the module); returns `path`. `lanes`: the kernels, 4 and (where this CPU
-    has AVX-512, as symjit compiles it only there) 8; default host_lanes(). precision "mixed": the split
-    kernels (compile_simd_split: kernel A in f64, kernel B in f32)"""
-    if precision == "mixed":
-        return compile_simd_split(path, prog, lanes)
-    if precision != "f64":
-        raise SimdError(f"precision {precision!r}: f64 or mixed")
+def jit_kernel(app: dict, isa: str, what: str, folder) -> bytes:
+    """the SIMD kernel of `app` for `isa` from symjit's JIT: `dump(.., what)`, "simd" or "simd-f32" (its
+    f32 twin: symjit >= 2.29.2)"""
     import symjit
+    a = json.loads(json.dumps(app))
+    a["program"]["config"]["options"]["enable_simd512"] = isa == "avx512"
+    f = symjit.load_json(json.dumps(a))
+    path = Path(folder) / "k.bin"
+    try:
+        f.dump(str(path), what)
+    except ValueError as e:
+        if what == "simd-f32":
+            raise SimdError(f"symjit {getattr(symjit, '__version__', '')} cannot dump an f32 kernel (simd-f32: "
+                            "symjit >= 2.29.2; its error, if any, is on stderr)") from e
+        raise SimdError(f"symjit dumps no SIMD kernel: {e}") from e
+    code = path.read_bytes()
+    path.unlink()
+    return code
+
+
+def compile_simd(path, prog: Lowered, isa: Optional[str] = None, precision: str = "f64"):
+    """the folder of `prog` (see the module) for the instruction set `isa` ("avx2", "avx512", "neon";
+    default host_isa()); returns `path`. The kernel: kernel.o (x86-64) or kernel.S + kernel.bin (aarch64),
+    pac_kernel, kernel.h. precision "split": the split kernels (compile_simd_split)"""
+    if precision in ("split", "mixed"):
+        return compile_simd_split(path, prog, isa)
+    if precision != "f64":
+        raise SimdError(f"precision {precision!r}: f64 or split")
     from ..simd import elf
-    lanes = tuple(host_lanes() if lanes is None else lanes)
-    if 4 not in lanes:
-        raise SimdError("device simd needs an x86-64 CPU with AVX2 and FMA to build on (symjit's JIT compiles the kernels)")
+    isa = _isa(isa)
     path = Path(path)
     path.mkdir(parents=True, exist_ok=True)
     app, _ = simd_application(prog)
     elf.no_relocations(app["mir"]["code"])
-    text = json.dumps(app)
-    (path / "kernel.json").write_text(text)
-    (path / "runner.h").write_text(runner_h(prog, lanes))
-    codes = {}
-    for n in lanes:
-        a = json.loads(text)
-        a["program"]["config"]["options"]["enable_simd512"] = n == 8
-        f = symjit.load_json(json.dumps(a))
-        f.dump(str(path / f"kernel{n}.bin"), "simd")
-        code = (path / f"kernel{n}.bin").read_bytes()
-        (path / f"kernel{n}.bin").unlink()
-        codes[n] = code
-        if n == 8 and code == codes.get(4):   # symjit gave its AVX2 kernel: no AVX-512 here
-            raise SimdError("symjit compiled no AVX-512 kernel on this CPU")
-        symbol = f"pac_simd{n}"
-        (path / f"kernel{n}.o").write_bytes(elf.elf_object(symbol, code))
-        (path / f"kernel{n}.h").write_text(elf.header(symbol, n, a["program"]["count_states"], a["program"]["count_obs"],
-                                                      elf.stack_bytes(a, n), f"{prog.process} {prog.colour}"))
+    (path / "kernel.json").write_text(json.dumps(app))
+    (path / "runner.h").write_text(runner_h(prog, isa))
+    code = jit_kernel(app, isa, "simd", path)
+    elf.write_object(path, "kernel", "pac_kernel", code, isa)
+    n = LANES[isa]
+    (path / "kernel.h").write_text(elf.header("pac_kernel", n, app["program"]["count_states"], app["program"]["count_obs"],
+                                              elf.stack_bytes(app, n), f"{prog.process} {prog.colour}, simd-{isa}"))
     return path
 
 
-def compile_simd_split(path, prog: Lowered, lanes: Optional[Sequence[int]] = None):
-    """compile_simd(precision = "mixed"): the split kernels (codegen/compile_split.py): per lane count n
-    kernel A in f64 (kernelA<n>.o, pac_split_a<n>: the momenta to the transfers) and kernel B in f32
-    (kernelB<2n>.o, pac_split_b<2n>: the transfers to the outputs, downgraded); runner.h defines
-    PAC_SIMD_SPLIT (PAC_SIMD_HAVE16 with the AVX-512 pair)"""
-    import symjit
-    from ..simd import downgrade, elf
+def compile_simd_split(path, prog: Lowered, isa: Optional[str] = None):
+    """compile_simd(precision = "split"): the split kernels (codegen/compile_split.py) for `isa`: kernel A
+    in f64 (kernelA, pac_kernel_a: the momenta to the transfers, its f64 lanes) and kernel B in f32
+    (kernelB, pac_kernel_b: the transfers to the outputs, twice the lanes: symjit's f32 twin of its f64
+    kernel, `dump(.., "simd-f32")`); runner.h defines PAC_SIMD_SPLIT"""
+    from ..simd import elf
     from .compile_split import split_applications
-    lanes = tuple(host_lanes() if lanes is None else lanes)
-    if 4 not in lanes:
-        raise SimdError("device simd needs an x86-64 CPU with AVX2 and FMA to build on (symjit's JIT compiles the kernels)")
+    isa = _isa(isa)
     path = Path(path)
     path.mkdir(parents=True, exist_ok=True)
-    app_a, app_b, roles, items = split_applications(prog)
+    app_a, app_b, _, items = split_applications(prog)
     for app in (app_a, app_b):
         elf.no_relocations(app["mir"]["code"])
     (path / "kernelA.json").write_text(json.dumps(app_a))
     (path / "kernelB.json").write_text(json.dumps(app_b))
-    (path / "runner.h").write_text(runner_h(prog, lanes, mixed=True))
-    what = f"{prog.process} {prog.colour}"
-    for n in lanes:
-        for tag, app in (("a", app_a), ("b", app_b)):
-            b = json.loads(json.dumps(app))
-            b["program"]["config"]["options"]["enable_simd512"] = n == 8
-            f = symjit.load_json(json.dumps(b))
-            f.dump(str(path / "k.bin"), "simd")
-            code = (path / "k.bin").read_bytes()
-            (path / "k.bin").unlink()
-            m = n
-            if tag == "b":
-                code = downgrade.downgrade(code, consts=b["mir"]["consts"], roles=roles)
-                m = 2 * n
-            symbol = f"pac_split_{tag}{m}"
-            (path / f"kernel{tag.upper()}{m}.o").write_bytes(elf.elf_object(symbol, code))
-            (path / f"kernel{tag.upper()}{m}.h").write_text(elf.header(
-                symbol, m, b["program"]["count_states"], b["program"]["count_obs"], elf.stack_bytes(b, n),
-                what + (", split kernel A (f64)" if tag == "a" else ", split kernel B (f32: floats, call with idx / 2)")))
+    (path / "runner.h").write_text(runner_h(prog, isa, split=True))
+    what = f"{prog.process} {prog.colour}, simd-{isa}-split"
+    n = LANES[isa]
+    for tag, app, dump, m in (("A", app_a, "simd", n), ("B", app_b, "simd-f32", 2 * n)):
+        code = jit_kernel(app, isa, dump, path)
+        symbol = f"pac_kernel_{tag.lower()}"
+        elf.write_object(path, f"kernel{tag}", symbol, code, isa)
+        (path / f"kernel{tag}.h").write_text(elf.header(
+            symbol, m, app["program"]["count_states"], app["program"]["count_obs"], elf.stack_bytes(app, n),
+            what + (", kernel A (f64)" if tag == "A" else ", kernel B (f32: floats, call with idx / 2)")))
     return path

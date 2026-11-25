@@ -51,23 +51,23 @@
  * events (umami_free prints one still pending). The alpha_s scale is the device's pow, which may
  * differ from glibc's by an ulp.
  *
- * With PAC_SIMD (umami_libraries(...; device = "simd")) the program is one symjit kernel (compile_simd:
- * kernel4.o, pac_simd4, AVX2; kernel8.o, pac_simd8, AVX-512, when the building CPU has AVX-512 and
- * runner.h defines PAC_SIMD_HAVE8). An instance takes AVX-512 if the library has it and the CPU too, else
- * AVX2; PAC_SIMD_LANES=4 or 8 asks for one. A call's
+ * With PAC_SIMD (umami_libraries(...; device = "simd-avx2", "simd-avx512" or "simd-neon")) the program is
+ * one symjit kernel for that instruction set (compile_simd: kernel.o on x86-64, kernel.S on aarch64;
+ * pac_kernel, kernel.h; runner.h names the set: PAC_SIMD_ISA_AVX2, _AVX512 or _NEON). An instance checks
+ * at initialization that the CPU runs it (AVX2 and FMA; AVX-512 F and DQ; aarch64 always). A call's
  * events go to the kernel PAC_SIMD_CHUNK at a time: their momenta as columns (the last chunk padded with
- * its last event to a multiple of the lanes), the kernel on 4 or 8 events per call, then each event's
+ * its last event to a multiple of the lanes), the kernel on 4, 8 or 2 events per call, then each event's
  * end (pac_finish) on its column of outputs. The checks, the scales and the end are the CPU build's, and
- * the kernel computes runner.c's values: the CPU build's bits. A kernel call uses PAC_SIMD8_STACK_BYTES
- * (PAC_SIMD4_STACK_BYTES) of the calling thread's stack. The kernels are symjit's JIT code in object files
- * (compile_simd, simd/elf.py): no relocations, no library calls.
+ * the kernel computes runner.c's values: the CPU build's bits. A kernel call uses PAC_KERNEL_STACK_BYTES
+ * of the calling thread's stack. The kernels are symjit's JIT code in object files (compile_simd,
+ * simd/elf.py): no relocations, no library calls.
  *
- * With PAC_SIMD and PAC_SIMD_SPLIT (device "simd", precision "mixed") the kernels are the split ones,
- * two a chunk (compile_simd(precision = "mixed"), codegen/compile_split.py): kernel A in f64 (kernelA4.o /
- * kernelA8.o, pac_split_a4 / a8) from the momenta to the transfers (forms, 1 / k·k, sources, the model
- * kernels' wide values), rounded to floats, then kernel B in f32 (kernelB8.o / kernelB16.o, AVX-512 with
- * PAC_SIMD_HAVE16; float columns: it reads element idx at byte 8 idx, called with idx / 2) to the
- * outputs, widened for the event's end; PAC_SIMD_LANES=8 or 16 asks for B's lanes (A runs half as many). */
+ * With PAC_SIMD and PAC_SIMD_SPLIT (precision "split": device "simd-avx2-split" and so on) the kernels
+ * are the split ones, two a chunk (compile_simd(precision = "split"), codegen/compile_split.py): kernel A
+ * in f64 (kernelA, pac_kernel_a, the set's f64 lanes) from the momenta to the transfers (forms, 1 / k·k,
+ * sources, the model kernels' wide values), rounded to floats, then kernel B in f32 (kernelB,
+ * pac_kernel_b: symjit's f32 twin, twice the lanes; float columns: it reads element idx at byte 8 idx,
+ * called with idx / 2) to the outputs, widened for the event's end. */
 #include "umami.h"
 #include "runner.h"
 #include <math.h>
@@ -83,26 +83,21 @@
 #define PAC_SIMD_CHUNK 64                      /* events per kernel batch: a multiple of 16 */
 #endif
 #if defined(PAC_SIMD_SPLIT)
-#include "kernelA4.h"
-#include "kernelB8.h"
-#ifdef PAC_SIMD_HAVE16
-#include "kernelA8.h"
-#include "kernelB16.h"
-#endif
-#define PAC_SIMD_STATES PAC_SPLIT_A4_COUNT_STATES      /* kernel A's: 4 x the legs, the momenta */
-#define PAC_SPLIT_TRANSFERS PAC_SPLIT_A4_COUNT_OBS     /* A's outputs, B's states */
-#define PAC_SIMD_COLUMNS (PAC_SPLIT_A4_COUNT_STATES + PAC_SPLIT_A4_COUNT_OBS)
-typedef double pac_simd_real;
+#include "kernelA.h"
+#include "kernelB.h"
+#define PAC_SIMD_LANES PAC_KERNEL_B_LANES              /* events per step: kernel B's (A takes half as many) */
+#define PAC_SIMD_STATES PAC_KERNEL_A_COUNT_STATES      /* kernel A's: 4 x the legs, the momenta */
+#define PAC_SPLIT_TRANSFERS PAC_KERNEL_A_COUNT_OBS     /* A's outputs, B's states */
+#define PAC_SIMD_COLUMNS (PAC_KERNEL_A_COUNT_STATES + PAC_KERNEL_A_COUNT_OBS)
 #else
-#include "kernel4.h"
-#ifdef PAC_SIMD_HAVE8
-#include "kernel8.h"
+#include "kernel.h"
+#define PAC_SIMD_LANES PAC_KERNEL_LANES
+#define PAC_SIMD_STATES PAC_KERNEL_COUNT_STATES        /* 4 x the legs: the momenta */
+#define PAC_SIMD_COLUMNS (PAC_KERNEL_COUNT_STATES + PAC_KERNEL_COUNT_OBS)
 #endif
-#define PAC_SIMD_STATES PAC_SIMD4_COUNT_STATES   /* 4 x the legs: the momenta */
-#define PAC_SIMD_COLUMNS (PAC_SIMD4_COUNT_STATES + PAC_SIMD4_COUNT_OBS)
-typedef double pac_simd_real;
+#if PAC_SIMD_CHUNK % PAC_SIMD_LANES != 0
+#error "PAC_SIMD_CHUNK must be a multiple of the kernel's lanes"
 #endif
-typedef int (*pac_simd_kernel)(double *, const symjit_slice *, size_t, const double *);
 #endif
 
 typedef struct {
@@ -120,12 +115,9 @@ typedef struct {
     double momenta[4 * PAC_PARTICLES];
     double values[RUNNER_OUTPUTS];
 #ifdef PAC_SIMD
-    pac_simd_kernel kernel;
-    size_t lanes;
-    pac_simd_real *columns;                    /* PAC_SIMD_COLUMNS columns of PAC_SIMD_CHUNK events */
+    double *columns;                           /* PAC_SIMD_COLUMNS columns of PAC_SIMD_CHUNK events */
 #ifdef PAC_SIMD_SPLIT
     double widened[RUNNER_OUTPUTS * PAC_SIMD_CHUNK];   /* kernel B's outputs, widened */
-    pac_simd_kernel kernel_b;
     float *bcolumns;                           /* B's columns: the transfers (rounded), then its outputs */
     symjit_slice bslices[PAC_SPLIT_TRANSFERS + RUNNER_OUTPUTS];
 #endif
@@ -143,58 +135,29 @@ typedef struct {
 } Instance;
 
 #ifdef PAC_SIMD
-/* the lanes of this CPU's kernel (8: AVX-512, 4: AVX2; split: kernel B's, 16, 8), PAC_SIMD_LANES if it asks for
- * one; 0: none */
-static size_t simd_lanes(void) {
-#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__)) && defined(PAC_SIMD_SPLIT)
-    __builtin_cpu_init();
-#ifdef PAC_SIMD_HAVE16
-    bool has16 = __builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512dq");
-#else
-    bool has16 = false;   /* built without the AVX-512 kernel */
-#endif
-    bool has8 = __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma");
-    char const *want = getenv("PAC_SIMD_LANES");
-    if (want != NULL && strcmp(want, "8") == 0) return has8 ? 8 : 0;
-    if (want != NULL && strcmp(want, "16") == 0) return has16 ? 16 : 0;
-    return has16 ? 16 : has8 ? 8 : 0;
+/* whether this CPU runs the library's kernels (runner.h: PAC_SIMD_ISA_...) */
+static bool simd_cpu(void) {
+#if defined(PAC_SIMD_ISA_NEON)
+    return true;   /* aarch64: NEON (Advanced SIMD) always */
 #elif defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
     __builtin_cpu_init();
-#ifdef PAC_SIMD_HAVE8
-    bool has8 = __builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512dq");
+#if defined(PAC_SIMD_ISA_AVX512)
+    return __builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512dq");
 #else
-    bool has8 = false;   /* built without the AVX-512 kernel */
+    return __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma");
 #endif
-    bool has4 = __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma");
-    char const *want = getenv("PAC_SIMD_LANES");
-    if (want != NULL && strcmp(want, "4") == 0) return has4 ? 4 : 0;
-    if (want != NULL && strcmp(want, "8") == 0) return has8 ? 8 : 0;
-    return has8 ? 8 : has4 ? 4 : 0;
 #else
-    return 0;
+    return false;
 #endif
 }
 
 static bool simd_setup(Instance *instance) {
-    instance->lanes = simd_lanes();
-    if (instance->lanes == 0) {
-        fprintf(stderr, "umami (%s %s): device simd needs an x86-64 CPU with AVX2 and FMA%s\n", RUNNER_PROCESS,
-                RUNNER_COLOUR, getenv("PAC_SIMD_LANES") ? " (or the kernel PAC_SIMD_LANES asks for: 8 needs AVX-512 "
-                "F and DQ and a library built on such a CPU)" : "");
+    if (!simd_cpu()) {
+        fprintf(stderr, "umami (%s %s): device %s needs %s\n", RUNNER_PROCESS, RUNNER_COLOUR, PAC_SIMD_DEVICE,
+                PAC_SIMD_NEEDS);
         return false;
     }
-#if defined(PAC_SIMD_SPLIT) && defined(PAC_SIMD_HAVE16)
-    instance->kernel = instance->lanes == 16 ? pac_split_a8 : pac_split_a4;
-    instance->kernel_b = instance->lanes == 16 ? pac_split_b16 : pac_split_b8;
-#elif defined(PAC_SIMD_SPLIT)
-    instance->kernel = pac_split_a4;
-    instance->kernel_b = pac_split_b8;
-#elif defined(PAC_SIMD_HAVE8)
-    instance->kernel = instance->lanes == 8 ? pac_simd8 : pac_simd4;
-#else
-    instance->kernel = pac_simd4;
-#endif
-    instance->columns = calloc((size_t)PAC_SIMD_COLUMNS * PAC_SIMD_CHUNK, sizeof(pac_simd_real));
+    instance->columns = calloc((size_t)PAC_SIMD_COLUMNS * PAC_SIMD_CHUNK, sizeof(double));
     if (instance->columns == NULL) return false;
     for (size_t j = 0; j < PAC_SIMD_COLUMNS; ++j) {
         instance->slices[j].ptr = (double *)(instance->columns + j * PAC_SIMD_CHUNK);
@@ -213,19 +176,19 @@ static bool simd_setup(Instance *instance) {
 
 /* the chunk's n events (the first is `first`): padded to the lanes, the kernel, each event's end */
 static bool simd_flush(Instance *instance, size_t n, size_t first, bool draw, void *const *out) {
-    size_t const lanes = instance->lanes, padded = (n + lanes - 1) / lanes * lanes;
+    size_t const lanes = PAC_SIMD_LANES, padded = (n + lanes - 1) / lanes * lanes;
     for (size_t j = 0; j < PAC_SIMD_STATES; ++j)
         for (size_t c = n; c < padded; ++c)
             instance->columns[j * PAC_SIMD_CHUNK + c] = instance->columns[j * PAC_SIMD_CHUNK + n - 1];
 #if defined(PAC_SIMD_SPLIT)
     /* kernel A (f64, lanes / 2 a call), its transfers rounded to floats, kernel B (f32, lanes a call) */
     for (size_t i = 0; i < padded; i += lanes / 2)
-        if (instance->kernel(NULL, instance->slices, i, NULL) != 0) return false;
+        if (pac_kernel_a(NULL, instance->slices, i, NULL) != 0) return false;
     double const *transfers = instance->columns + (size_t)PAC_SIMD_STATES * PAC_SIMD_CHUNK;
     for (size_t t = 0; t < (size_t)PAC_SPLIT_TRANSFERS * PAC_SIMD_CHUNK; ++t)
         instance->bcolumns[t] = (float)transfers[t];
     for (size_t i = 0; i < padded; i += lanes)   /* floats: element i at byte 4 i = 8 (i / 2) */
-        if (instance->kernel_b(NULL, instance->bslices, i / 2, NULL) != 0) return false;
+        if (pac_kernel_b(NULL, instance->bslices, i / 2, NULL) != 0) return false;
     float const *bout = instance->bcolumns + (size_t)PAC_SPLIT_TRANSFERS * PAC_SIMD_CHUNK;
     for (size_t h = 0; h < RUNNER_OUTPUTS; ++h)
         for (size_t c = 0; c < n; ++c)
@@ -233,7 +196,7 @@ static bool simd_flush(Instance *instance, size_t n, size_t first, bool draw, vo
     double const *values = instance->widened;
 #else
     for (size_t i = 0; i < padded; i += lanes)
-        if (instance->kernel(NULL, instance->slices, i, NULL) != 0) return false;
+        if (pac_kernel(NULL, instance->slices, i, NULL) != 0) return false;
     double const *values = instance->columns + (size_t)PAC_SIMD_STATES * PAC_SIMD_CHUNK;
 #endif
     for (size_t c = 0; c < n; ++c) {

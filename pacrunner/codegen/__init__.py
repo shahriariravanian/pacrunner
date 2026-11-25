@@ -1,7 +1,8 @@
 """pacrunner.codegen: a program as C (pac-julia's compile.jl and compile_vm.jl): straight-line code, or
 the UIR interpreter's tables (interpreter=True); compile_metal (compile_metal.jl): the program for the
-Metal runner (Apple GPUs, c/metal/); compile_simd: the program as one symjit kernel, its AVX2 and
-AVX-512 objects (device "simd").
+Metal runner (Apple GPUs, c/metal/); compile_simd: the program as one symjit kernel for AVX2, AVX-512
+or NEON, as an object (the SIMD devices simd-avx2, simd-avx512, simd-neon; precision split: two kernels,
+f64 and f32).
 
     from pacrunner import uir, codegen
     ls = uir.load_recurrence_export("export.json")

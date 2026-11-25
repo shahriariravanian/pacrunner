@@ -3,12 +3,15 @@ changing MadGraph7: the AmplicolSubprocess class is replaced, in this process on
 loads the libraries of umami_libraries (one per program, flavour 0) and lets MadSpace split each
 batch by flavour (one DifferentialCrossSection per library of the UMAMI channel).
 
-  python mg7_run.py prepare OUTPUT [--device cpu|simd|cuda|cuda_provider|metal] [--precision f64|mixed|...] [--python PYTHON]
+  python mg7_run.py prepare OUTPUT [--device cpu|simd-avx2|simd-avx512|simd-neon|simd|cuda|cuda_provider|metal]
+                                   [--precision f64|mixed|split] [--python PYTHON]
       the recurrence export of every SubProcesses/*/lc artifact and, per UMAMI provider, the
-      libraries in OUTPUT/lib/pacrunner[-<device>]/<name>_<provider>/umami_pac.json (metal: macOS, always
-      mixed f32/df64; its libraries are CPU providers, run with run.device = ["cpu"]; simd: x86-64, one
-      symjit kernel per program: symjit's AVX2 and AVX-512 kernels as object files)
-  python mg7_run.py run OUTPUT [--device cpu|simd|cuda|cuda_provider|metal|<device>-<precision>|stock] [generate_events arguments, default -f]
+      libraries in OUTPUT/lib/pacrunner[-<build>]/<name>_<provider>/umami_pac.json, <build> the device and
+      its precision (python -m pacrunner.umami --target: simd-avx512-split, cuda-mixed, ...; metal: macOS,
+      always mixed f32/df64; its libraries are CPU providers, run with run.device = ["cpu"]; the SIMD
+      devices: one symjit kernel per program for AVX2, AVX-512 or NEON, simd this machine's, precision
+      split the f64 + f32 kernels, also as a device name: --device simd-neon-split)
+  python mg7_run.py run OUTPUT [--device cpu|<build>|simd|simd-split|stock] [generate_events arguments, default -f]
       bin/generate_events with the replaced subprocess class (stock libraries still built: the
       full-colour pass keeps the stock ratio library); PAC_UMAMI_TIMER=LOG times every call of the
       PacRunner libraries (test/umami_timer.c). --device stock: MadGraph7's own subprocess class
@@ -80,6 +83,18 @@ def python_build(python=PYTHON):
         env=env)
 
 
+def build_name(device="cpu", precision="f64", python=PYTHON):
+    """the folder name of a build (pacrunner's _env.library_name, through `python`): the device's own
+    name and its precision unless f64; a name may carry its precision (cuda-mixed, simd-split)"""
+    for p in ("mixed", "split"):
+        if device.endswith("-" + p) and precision == "f64":
+            device, precision = device[:-len(p) - 1], p
+    if device in ("cpu", "stock"):
+        return device
+    return subprocess.check_output([python, "-m", "pacrunner.umami", "--target", "--device", device, "--precision",
+                                    precision], text=True).strip()
+
+
 def prepare(output, device="cpu", python=PYTHON, precision="f64", build=None):
     """The recurrence export and the PacRunner libraries of every [amplicol] provider of `output`;
     `build(export, metadata, dir, device, precision)` runs umami_libraries (default: a python
@@ -97,7 +112,7 @@ def prepare(output, device="cpu", python=PYTHON, precision="f64", build=None):
         lc = os.path.join(output, entry["artifact"])
         jobs.setdefault(entry["me_path"], (lc, entry["parameters"]))
     for me_path, (lc, references) in sorted(jobs.items()):
-        dir_ = table_dir(output, me_path, device if precision == "f64" else f"{device}-{precision}")
+        dir_ = table_dir(output, me_path, build_name(device, precision, python))
         os.makedirs(dir_, exist_ok=True)
         # resolved with the values mg7 gives umami_set_parameter (amplicol_parameters): the param
         # card's, which differ from the model defaults in the last digits
@@ -245,7 +260,7 @@ def run(output, args, device="cpu"):
         if not os.path.isdir(os.path.join(cuda, "madspace")):
             sys.exit(f"--device {device} needs a CUDA build of MadSpace in {cuda}")
         sys.path.insert(0, cuda)
-    install_stock(output) if device == "stock" else install(output, device)
+    install_stock(output) if device == "stock" else install(output, build_name(device))
     from madgraph.mg7.launch import main
     os.chdir(output)
     sys.argv = [os.path.join(output, "bin", "generate_events")] + (args or ["-f"])
