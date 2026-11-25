@@ -1,5 +1,6 @@
-"""Fragments written as symjit MIR directly (plans/F32-KERNEL.md): the mixed fragments need fused
-multiply-adds (double-double arithmetic: two_prod), which symjit's expression trees cannot ask for
+"""Fragments written as symjit MIR directly (plans/F32-KERNEL.md): the split kernels' fragments (the
+model kernels' A and B sides, the propagators on a transferred 1 / k·k) need their operations exactly as
+written (fused multiply-adds where the kernel has them), which symjit's expression trees cannot ask for
 without fastmath, and fastmath would also contract and reorder the rest.
 
 `Mir` builds a straight-line fragment over values (Val): loads of its inputs (Mem 0 .. n_in), constants,
@@ -8,10 +9,6 @@ stores to its outputs (Mem n_in ..). Registers: Gen 0 .. 13 (ymm2 .. ymm15 / zmm
 are the generators'), allocated in order of use; a value whose register is needed while it is still live
 is spilled to one of the fragment's Stack slots (the furthest next use first) and reloaded when used.
 The result is a library fragment (simd/library.py's format) that compile_simd splices like the others.
-
-`DD` is double-double arithmetic on pairs of Vals, c/metal/df64.h's algorithms in its exact order of
-operations (Joldes, Muller, Popescu 2017: AccurateDWPlusDW, DWTimesDW3, DWDivDW2; Karp-Markstein sqrt),
-so that the fragment, downgraded to f32 (simd/downgrade.py), computes df64.h's bits.
 """
 from __future__ import annotations
 
@@ -234,150 +231,3 @@ class Mir:
         return {"format": "pacrunner-simd-fragment", "format_version": 1, "name": self.name, "symjit_version": None,
                 "inputs": self.inputs, "outputs": self.n_out, "count_stack": SPILL_BASE + nslots + 2, "consts": self.consts,
                 "code": code}
-
-
-@dataclass(frozen=True)
-class dd:
-    hi: Val
-    lo: Val
-
-
-class DD:
-    """double-double on a Mir: df64.h, operation for operation"""
-
-    def __init__(self, m: Mir):
-        self.m = m
-
-    def input(self, name: str) -> dd:
-        return dd(self.m.input(name + ".hi"), self.m.input(name + ".lo"))
-
-    def exact(self, x: float) -> dd:
-        """an exact constant (dd_f): (x, 0)"""
-        return dd(self.m.const(x), self.m.const(0.0))
-
-    def of(self, x: Val) -> dd:
-        """a plain value widened exactly (dd_f)"""
-        return dd(x, self.m.const(0.0))
-
-    def to_plain(self, x: dd) -> Val:
-        """dd_to_f: hi + lo, rounded once"""
-        return self.m.add(x.hi, x.lo)
-
-    def two_sum(self, a: Val, b: Val) -> dd:
-        m = self.m
-        s = m.add(a, b)
-        bb = m.sub(s, a)
-        return dd(s, m.add(m.sub(a, m.sub(s, bb)), m.sub(b, bb)))
-
-    def fast_two_sum(self, a: Val, b: Val) -> dd:
-        m = self.m
-        s = m.add(a, b)
-        return dd(s, m.sub(b, m.sub(s, a)))
-
-    def two_prod(self, a: Val, b: Val) -> dd:
-        m = self.m
-        p = m.mul(a, b)
-        return dd(p, m.fms(a, b, p))
-
-    def neg(self, x: dd) -> dd:
-        return dd(self.m.neg(x.hi), self.m.neg(x.lo))
-
-    def add(self, x: dd, y: dd) -> dd:                   # AccurateDWPlusDW
-        m = self.m
-        s, t = self.two_sum(x.hi, y.hi), self.two_sum(x.lo, y.lo)
-        v = self.fast_two_sum(s.hi, m.add(s.lo, t.hi))
-        return self.fast_two_sum(v.hi, m.add(t.lo, v.lo))
-
-    def sub(self, x: dd, y: dd) -> dd:                   # x + (-y)
-        return self.add(x, self.neg(y))
-
-    def mul(self, x: dd, y: dd) -> dd:                   # DWTimesDW3
-        m = self.m
-        ch = m.mul(x.hi, y.hi)
-        cl1 = m.fms(x.hi, y.hi, ch)
-        tl0 = m.mul(x.lo, y.lo)
-        tl1 = m.fma(x.hi, y.lo, tl0)
-        cl2 = m.fma(x.lo, y.hi, tl1)
-        return self.fast_two_sum(ch, m.add(cl1, cl2))
-
-    def div(self, x: dd, y: dd) -> dd:                   # DWDivDW2
-        m = self.m
-        th = m.div(x.hi, y.hi)
-        rh = m.mul(y.hi, th)
-        rl1 = m.fms(y.hi, th, rh)
-        rl3 = m.fma(y.lo, th, rl1)
-        r = self.fast_two_sum(rh, rl3)
-        pi_h = m.sub(x.hi, r.hi)
-        delta = m.add(pi_h, m.sub(x.lo, r.lo))
-        return self.fast_two_sum(th, m.div(delta, y.hi))
-
-
-class DDX(DD):
-    """DD with df64.h's comparisons, selects and the functions the wavefunctions use (masks per lane:
-    df64.h's branches become selects, both sides computed)"""
-
-    def zero(self) -> dd:
-        return self.exact(0.0)
-
-    def select(self, mask: Val, x: dd, y: dd) -> dd:
-        return dd(self.m.select(mask, x.hi, y.hi), self.m.select(mask, x.lo, y.lo))
-
-    # comparisons (hi decides, lo breaks ties)
-    def lt(self, a: dd, b: dd) -> Val:
-        m = self.m
-        return m.or_(m.lt(a.hi, b.hi), m.and_(m.eq(a.hi, b.hi), m.lt(a.lo, b.lo)))
-
-    def le(self, a: dd, b: dd) -> Val:
-        m = self.m
-        return m.or_(m.lt(a.hi, b.hi), m.and_(m.eq(a.hi, b.hi), m.le(a.lo, b.lo)))
-
-    def gt(self, a: dd, b: dd) -> Val:
-        return self.lt(b, a)
-
-    def ne(self, a: dd, b: dd) -> Val:
-        m = self.m
-        return m.or_(m.ne(a.hi, b.hi), m.ne(a.lo, b.lo))
-
-    def is_zero(self, x: dd) -> Val:
-        m = self.m
-        z = m.const(0.0)
-        return m.and_(m.eq(x.hi, z), m.eq(x.lo, z))
-
-    def isnan(self, x: dd) -> Val:
-        m = self.m
-        return m.or_(m.ne(x.hi, x.hi), m.ne(x.lo, x.lo))
-
-    def signbit_mask(self, x: dd) -> Val:
-        """dd_signbit as a mask, for a number (not NaN): hi < 0, or hi = -0 (1 / hi < 0)"""
-        m = self.m
-        z = m.const(0.0)
-        return m.or_(m.lt(x.hi, z), m.and_(m.eq(x.hi, z), m.lt(m.div(m.const(1.0), x.hi), z)))
-
-    # sign-bit operations: exact, as df64.h's negations
-    def abs(self, x: dd) -> dd:
-        s = self.m.sign(x.hi)
-        return dd(self.m.xor(x.hi, s), self.m.xor(x.lo, s))
-
-    def copysign(self, x: dd, s: dd) -> dd:
-        m = self.m
-        d = m.xor(m.sign(x.hi), m.sign(s.hi))
-        return dd(m.xor(x.hi, d), m.xor(x.lo, d))
-
-    def sqrt(self, x: dd) -> dd:
-        """Karp-Markstein: one correction of the plain root; (sqrt(hi), 0) where hi > 0 does not hold"""
-        m = self.m
-        s = m.sqrt(x.hi)
-        r = self.sub(x, self.two_prod(s, s))
-        good = self.fast_two_sum(s, m.div(r.hi, m.mul(m.const(2.0), s)))
-        return self.select(m.gt(x.hi, m.const(0.0)), good, dd(s, m.const(0.0)))
-
-    def max(self, x: dd, y: dd) -> dd:
-        """Julia's max (NaN propagates as x + y; max(-0, 0) = 0)"""
-        tie = self.select(self.signbit_mask(x), y, x)
-        r = self.select(self.ne(x, y), self.select(self.gt(x, y), x, y), tie)
-        return self.select(self.m.or_(self.isnan(x), self.isnan(y)), self.add(x, y), r)
-
-    def min(self, x: dd, y: dd) -> dd:
-        tie = self.select(self.signbit_mask(x), x, y)
-        r = self.select(self.ne(x, y), self.select(self.lt(x, y), x, y), tie)
-        return self.select(self.m.or_(self.isnan(x), self.isnan(y)), self.add(x, y), r)

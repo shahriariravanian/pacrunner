@@ -118,6 +118,15 @@ rt_simd = provider_simd.runtime(0)
 print(rt_simd(batch, 0).matrix_element)     # should print [2.43239313e-05], as the cpu provider
 ```
 
+`compile(device="simd", precision="mixed")` runs each program as two kernels: kernel A in f64 computes what
+needs f64 from the momenta (the forms, `1/k²` of the propagators, the sources' wavefunctions, the wide parts of
+the model kernels: their denominators `k² − M²`), rounded to f32; kernel B computes the rest (vertices,
+propagators, model kernels, amplitudes, the reduction) in f32 at twice the lanes (8 with AVX2, 16 with
+AVX-512; `PAC_SIMD_LANES=8` asks for AVX2). Kernel B is symjit's f64 kernel rewritten instruction by
+instruction to f32 (`pacrunner/simd/downgrade.py`); `codegen/compile_split.py` splits the program.
+The matrix element is within about 1e-6 of f64, and 1.2–1.9× faster than `simd` in f64 (more with model
+kernels and many propagators).
+
 For now, let's continue with generating CUDA providers. 
 PacRunner currently supports two types of GPU backend: `compile(device="cuda")` and `compile(device="cuda_provider")`
 (also called `device="cuda_full"`: everything on the GPU). 

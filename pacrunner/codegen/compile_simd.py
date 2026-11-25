@@ -40,7 +40,6 @@ from pathlib import Path
 from typing import Optional, Sequence
 
 from ..simd import library
-from ..simd import mixed as mixed_fragments
 from ..uir import (InputKind, Lowered, Opcode, PhysicalType, is_kernel, is_propagator, is_vertex, source_fields,
                    validate)
 from .common import ArenaIndex, CompileError, cstring
@@ -66,25 +65,14 @@ def bits(x: float) -> str:
     return "0x%016x" % struct.unpack("<Q", struct.pack("<d", float(x)))[0]
 
 
-class DDC(float):
-    """a part of a dd constant (the mixed kernels): `part` "hi" or "lo" of the double `exact`. In the
-    f64 + double-double kernel the pair is (exact, 0.0); the downgrade (simd/downgrade.py, the kernel's
-    roles) splits it as the Metal host does: (fl32(exact), fl32(exact - fl32(exact)))."""
-
-    def __new__(cls, part: str, exact: float):
-        o = super().__new__(cls, float(exact) if part == "hi" else 0.0)
-        o.part, o.exact = part, float(exact)
-        return o
-
-
 def ckey(x) -> object:
-    """a constant's key in the pool: its bits; a dd part's, its part and its exact value's"""
-    return (x.part, bits(x.exact)) if isinstance(x, DDC) else bits(x)
+    """a constant's key in the pool: its bits"""
+    return bits(x)
 
 
 def role(x) -> list:
-    """a constant's role (the downgrade's): ["plain"], or ["hi" | "lo", exact]"""
-    return [x.part, x.exact] if isinstance(x, DDC) else ["plain"]
+    """a constant's role for the downgrade's check (a split kernel B's constants are already f32 values)"""
+    return ["plain"]
 
 
 def cmul(a: complex, b: complex) -> complex:
@@ -201,7 +189,7 @@ class Assembler:
         self.results = 0
         self.bodies = []
         self.T = None
-        self.extra = 0          # the mixed kernels' slots after the arena (MixedAssembler)
+        self.extra = 0          # slots after the arena (compile_split's kernel B: the transfers)
 
     # ---- slots and constants ----
     def const(self, x) -> int:
@@ -766,7 +754,7 @@ class Assembler:
                 "stack": self.T + self.b.size + self.extra + self.scratch_used + len(self.cslots) + self.results}
 
 
-# ---- the mixed kernels (f64 + double-double, downgraded to the Metal runner's f32 + df64) ----------------
+# ---- f32 folding (the split kernels' kernel B: codegen/compile_split.py) --------------------------------
 
 def fl32(x: float) -> float:
     """x rounded to f32 (to nearest)"""
@@ -784,283 +772,6 @@ def rmul32(a: complex, b: complex) -> complex:
     re = fl32(fl32(a.real * b.real) - fl32(a.imag * b.imag))
     im = fl32(fl32(a.real * b.imag) + fl32(a.imag * b.real))
     return complex(re, im)
-
-
-def dd(x: float) -> tuple:
-    """a dd constant's parts (DDC)"""
-    return DDC("hi", x), DDC("lo", x)
-
-
-def mixed_called(name: str) -> bool:
-    """the mixed kernels' subroutines: called()'s, and the dd row fragments kout, cmul_round, closure"""
-    return called(name) or name.startswith(("kout:", "cmul_round:", "closure:"))
-
-
-class MixedAssembler(Assembler):
-    """the mixed kernel (plans/F32-KERNEL.md): the Metal runner's uir_run (c/metal/uirvm.metal) as an
-    f64 + double-double kernel, which simd/downgrade.py turns into its f32 + df64 twin, bit for bit the
-    Metal runner's. The states: the momenta's hi parts (Mem 4 leg + j), then their lo parts; the outputs:
-    hi parts, then lo parts (Mem 8 legs + h, + outputs). The forms and amplitudes are dd: their hi parts in
-    the arena, their lo parts after it ("extra"), then the forms rounded (the three-vector vertex's). The
-    rows' f32 constants are folded as the Metal runner computes them (rmul32 of rf), its df64 tables are dd
-    constants (DDC), its roles in `roles`. Model kernels: simd/mixed_kernel.py (kernel_msl's typing)."""
-
-    def __init__(self, prog: Lowered, call=None):
-        # the dd row arithmetic (a kernel row's outputs, a source's components, closures) as subroutines
-        # too: each is a few hundred MIR, inlined per row it would dominate the kernel's code
-        super().__init__(prog, call or mixed_called)
-        self.kwide = {}          # a mixed kernel fragment's wide constants, in its w<i> order
-        F, A = len(prog.forms), prog.amplitudes
-        self.nlo = 4 * F + 2 * A
-        self.extra = self.nlo + 4 * F
-
-    def count_states(self) -> int:
-        return 8 * self.prog.legs
-
-    def count_obs(self) -> int:
-        return 2 * self.prog.output_count()
-
-    def momentum_lo(self, leg, j):
-        return {"Mem": 4 * self.prog.legs + 4 * leg + j}
-
-    def out(self, h):
-        return {"Mem": 8 * self.prog.legs + h}
-
-    def out_lo(self, h):
-        return {"Mem": 8 * self.prog.legs + self.prog.output_count() + h}
-
-    def form_lo(self, f, j):
-        return ("extra", 4 * f + j)
-
-    def form_r(self, f, j):
-        return ("extra", self.nlo + 4 * f + j)
-
-    def amp_lo(self, a):
-        q = 4 * len(self.prog.forms) + 2 * a
-        return ("extra", q), ("extra", q + 1)
-
-    def frag(self, name):
-        if name.endswith(":mixed"):
-            if name not in self.frags:
-                if name.startswith("kernel:"):
-                    from ..simd import mixed_kernel
-                    from .common import kernel_info
-                    sha = name.split(":")[1]
-                    k = next(s.kernel for s in self.prog.stubs if s.kernel.sha256 == sha)
-                    info = kernel_info(k)
-                    self.frags[name], self.kwide[name] = mixed_kernel.kernel_fragment(
-                        k.name, info.mir, info.inputs, info.outputs)
-                else:
-                    self.frags[name] = mixed_fragments.fragment(name)
-            return self.frags[name]
-        return super().frag(name)
-
-    def frag_name(self, op):
-        p, o = self.prog, op.op
-        if is_propagator(o):
-            return f"propagator:{PROPAGATOR[o]}:mixed"
-        if o == Opcode.CLOSURE:
-            n = len(p.lists[op.t])
-            return f"closure:{n}:mixed" if n else None
-        if o == Opcode.SOURCE:
-            return self.wave_name(op)
-        if is_kernel(o):
-            return f"kernel:{p.stubs[p.instances[op.t][0]].kernel.sha256}:mixed"
-        return super().frag_name(op)
-
-    def wave_name(self, op):
-        (family, anti, h, ch) = source_fields(op)
-        mass = self.prog.scales[op.t].real
-        a = "anti" if anti else "part"
-        if family == PhysicalType.SCALAR:
-            return "wave:scalar:mixed"
-        if family == PhysicalType.WEYL:
-            return f"wave:weyl:{a}:{h}:{ch}:mixed"
-        if family == PhysicalType.DIRAC:     # pacops.metal: dd_abs(mass).hi < 1.0e-8f
-            return f"wave:dirac:{a}:{h}:{'massless' if abs(fl32(mass)) < fl32(1.0e-8) else 'massive'}:mixed"
-        if family == PhysicalType.VECTOR:
-            return f"wave:gluon:{h}:mixed" if mass == 0 else f"wave:massive_vector:{h}:mixed"
-        raise SimdError(f"a source of family {family}")
-
-    def form_name(self, f):
-        return f"form:{len(f.terms)}:{'plain' if self.prog.crossing is None else 'crossed'}:mixed"
-
-    def needed(self):
-        p = self.prog
-        names = {self.frag_name(op) for op in p.ops} | {self.form_name(f) for f in p.forms}
-        names |= {"cmul_round:mixed", "reduce:plain:mixed", "reduce:scaled:mixed", "group:mixed"}
-        names |= {f"kout:{a}:{b}:mixed" for a in ("direct", "neg", "scaled") for b in ("set", "add")}
-        return sorted(n for n in names if n)
-
-    def amp_inputs(self, a):
-        (re, im), (lre, lim) = self.amp(a), self.amp_lo(a)
-        return {"amp.re.hi": re, "amp.re.lo": lre, "amp.im.hi": im, "amp.im.lo": lim}
-
-    def assemble(self):
-        p, b = self.prog, self.b
-        stacks = [self.frag(n)["count_stack"] for n in self.needed()]
-        self.T = max([80, *stacks])
-        self.zero([("arena", i) for i in range(b.size)] + [("extra", i) for i in range(self.extra)])
-        self.zero([t for h in range(p.output_count()) for t in (self.out(h), self.out_lo(h))])
-        for i, f in enumerate(p.forms):          # uir_forms_layout: 0 + Σ coefficient × (sign ×) leg, in dd
-            name = self.form_name(f)
-            for j in range(4):
-                ins = {}
-                for t, (leg, coef) in enumerate(f.terms):
-                    if p.crossing is not None:
-                        (leg, sign) = p.crossing[leg]
-                        ins[f"s{t}.hi"], ins[f"s{t}.lo"] = dd(sign)
-                    ins[f"m{t}.hi"], ins[f"m{t}.lo"] = self.momentum(leg, j), self.momentum_lo(leg, j)
-                    ins[f"c{t}.hi"], ins[f"c{t}.lo"] = dd(coef)
-                self.inline(name, ins, [self.form(i, j), self.form_lo(i, j), self.form_r(i, j)])
-        for op in p.ops:
-            self.row(op)
-            self.rows_done += 1
-        (num, den) = p.group_factor
-        if num != den:                           # uir_group: x × dd_int(num) ÷ dd_int(den)
-            for h in range(p.output_count()):
-                ins = {"x.hi": self.out(h), "x.lo": self.out_lo(h)}
-                ins["n.hi"], ins["n.lo"] = dd(float(num))
-                ins["d.hi"], ins["d.lo"] = dd(float(den))
-                self.inline("group:mixed", ins, [self.out(h), self.out_lo(h)])
-        self.finish()
-        return self.application()
-
-    def row(self, op):
-        p, o = self.prog, op.op
-        name = self.frag_name(op)
-        if is_vertex(o):                         # vertex_row: s = rmul(rscale, rfactor) in f32
-            nl, nr, no = library.VERTICES[VERTEX[o]]
-            ins = {**self.current_inputs("l", op.l, nl), **self.current_inputs("r", op.r, nr)}
-            s = rmul32(rf(p.scales[op.t]), rf(p.factors[op.x]))
-            ins["s.re"], ins["s.im"] = s.real, s.imag
-            if o == Opcode.V_THREE_VECTOR:       # the forms rounded (load_form_r)
-                fu, fv = p.edge_form(op.l), p.edge_form(op.r)
-                for j in range(4):
-                    ins[f"u{j}"], ins[f"v{j}"] = self.form_r(fu, j), self.form_r(fv, j)
-                ins["two"] = 2.0
-            if not op.set:
-                ins.update(self.current_inputs("old", op.d, no))
-            self.inline(name, ins, [t for j in range(no) for t in self.edge(op.d, j)])
-        elif is_propagator(o):                   # the factor f32 (the vector's × (0, -1) in f32), k in dd
-            n = 4 if o == Opcode.P_VECTOR else 2
-            ins = self.current_inputs("c", op.d, n)
-            fd = p.edge_form(op.d)
-            for j in range(4):
-                ins[f"k{j}.hi"], ins[f"k{j}.lo"] = self.form(fd, j), self.form_lo(fd, j)
-            f = rf(p.factors[op.x])
-            if o == Opcode.P_VECTOR:
-                f = rmul32(f, complex(0.0, -1.0))
-            ins["f.re"], ins["f.im"] = f.real, f.imag
-            self.inline(name, ins, [t for j in range(n) for t in self.edge(op.d, j)])
-        elif o == Opcode.CLEAR_AMPLITUDE:
-            self.zero(list(self.amp(op.d)) + list(self.amp_lo(op.d)))
-        elif o == Opcode.CLOSURE:                # closure_row: c_j = rmul(rfactor_j, rfactor) in f32
-            entries = p.lists[op.t]
-            if not entries:
-                return
-            n = len(entries)
-            ins = {**self.current_inputs("l", op.l, n), **self.current_inputs("r", op.r, n)}
-            f = rf(p.factors[op.x])
-            for j, x in enumerate(entries):
-                c = rmul32(rf(p.factors[x]), f)
-                ins[f"c{j}.re"], ins[f"c{j}.im"] = c.real, c.imag
-            ins.update(self.amp_inputs(op.d))
-            a = self.amp_inputs(op.d)
-            self.inline(name, ins, [a["amp.re.hi"], a["amp.re.lo"], a["amp.im.hi"], a["amp.im.lo"]])
-        elif o == Opcode.SOURCE:
-            self.mixed_source(op, name)
-        elif o == Opcode.REDUCE:                 # run_reduce, in dd
-            ins = self.amp_inputs(op.t)
-            if op.x is not None:
-                s = p.factors[op.x]
-                ins["s.re.hi"], ins["s.re.lo"] = dd(s.real)
-                ins["s.im.hi"], ins["s.im.lo"] = dd(s.imag)
-            ins["w.hi"], ins["w.lo"] = dd(p.weights[op.n])
-            ins["acc.hi"], ins["acc.lo"] = self.out(op.d), self.out_lo(op.d)
-            self.inline(f"reduce:{'plain' if op.x is None else 'scaled'}:mixed", ins, [self.out(op.d), self.out_lo(op.d)])
-        else:
-            super().row(op)
-
-    def kernel_row(self, op, name):
-        """uir_stub: the stub's inputs as df64 (planes widened exactly, forms, scales and the factor as the
-        df64 tables), the kernel (mixed_kernel), each output pair through uir_output (kout)"""
-        p, o = self.prog, op.op
-        (s, set_) = p.instances[op.t]
-        stub = p.stubs[s]
-        scaleset = p.scalesets[set_]
-        d = self.frag(name)
-        ins = {}
-        for k, i in enumerate(stub.inputs):
-            im = 1 if i.im else 0
-            if i.kind in (InputKind.IN_L, InputKind.IN_R, InputKind.OUT):
-                e = {InputKind.IN_L: op.l, InputKind.IN_R: op.r, InputKind.OUT: op.d}[i.kind]
-                ins[f"x{k}.hi"], ins[f"x{k}.lo"] = ("arena", self.b.edge_at(p, e) + 2 * i.n + im), 0.0
-            elif i.kind in (InputKind.MOMENTUM_U, InputKind.MOMENTUM_V):
-                f = p.edge_form(op.l if i.kind == InputKind.MOMENTUM_U else op.r)
-                ins[f"x{k}.hi"], ins[f"x{k}.lo"] = self.form(f, i.n), self.form_lo(f, i.n)
-            elif i.kind == InputKind.SCALE:
-                ins[f"x{k}.hi"], ins[f"x{k}.lo"] = dd(float(p.scales[scaleset[i.n]].real))
-            else:                            # FACTOR
-                z = p.factors[op.x]
-                ins[f"x{k}.hi"], ins[f"x{k}.lo"] = dd(float(z.imag if im else z.real))
-        for w, x in enumerate(self.kwide[name]):
-            ins[f"w{w}.hi"], ins[f"w{w}.lo"] = dd(x)
-        n_out = d["outputs"]                  # hi, lo of each output value
-        res = [("scratch", j) for j in range(n_out)]
-        self.scratch_used = max(self.scratch_used, n_out)
-        self.inline(name, {n: ins[n] for n in d["inputs"]}, res)
-        mode = "set" if op.set else "add"
-        z = p.factors[op.x]
-        # × (1, 0) and × (-1, 0) in dd are ± the pair (kout's doc): no multiply
-        kind = ("direct" if o == Opcode.KERNEL_DIRECT or z == complex(1.0, 0.0)
-                else "neg" if z == complex(-1.0, 0.0) else "scaled")
-        for n, comp in enumerate(stub.outputs):
-            c = {"p.re.hi": res[4 * n], "p.re.lo": res[4 * n + 1], "p.im.hi": res[4 * n + 2], "p.im.lo": res[4 * n + 3]}
-            if kind == "scaled":
-                c["f.re.hi"], c["f.re.lo"] = dd(z.real)
-                c["f.im.hi"], c["f.im.lo"] = dd(z.imag)
-            dre, dim = self.edge(op.d, comp)
-            if mode == "add":
-                c["old.re"], c["old.im"] = dre, dim
-            self.inline(f"kout:{kind}:{mode}:mixed", c, [dre, dim])
-
-    def row_factor(self, x) -> complex:
-        """the Metal runner's f32 copy of the factor (rfactor): the f64 rows' MIR, which the downgrade makes
-        f32, on f32 constants"""
-        return rf(self.prog.factors[x])
-
-    def mixed_source(self, op, name):
-        """source_row: the bare wavefunction in dd, then each component × its factor (dd), rounded once
-        into the plane; an embedding's entries likewise, or 0"""
-        p = self.prog
-        (family, anti, h, ch) = source_fields(op)
-        n = {PhysicalType.SCALAR: 1, PhysicalType.WEYL: 2}.get(family, 4)
-        fd = p.edge_form(op.d)
-        ins = {}
-        for j in range(4):
-            ins[f"k{j}.hi"], ins[f"k{j}.lo"] = self.form(fd, j), self.form_lo(fd, j)
-        ins["mass.hi"], ins["mass.lo"] = dd(p.scales[op.t].real)
-        w = [("scratch", j) for j in range(4 * n)]
-        self.scratch_used = max(self.scratch_used, 4 * n)
-        self.inline(name, {k: ins[k] for k in self.frag(name)["inputs"]}, w)
-
-        def component(target_j, wave_j, z: complex):
-            c = {"v.re.hi": w[4 * wave_j], "v.re.lo": w[4 * wave_j + 1], "v.im.hi": w[4 * wave_j + 2],
-                 "v.im.lo": w[4 * wave_j + 3]}
-            c["f.re.hi"], c["f.re.lo"] = dd(z.real)
-            c["f.im.hi"], c["f.im.lo"] = dd(z.imag)
-            self.inline("cmul_round:mixed", c, list(self.edge(op.d, target_j)))
-
-        if op.l is None:
-            for j in range(n):
-                component(j, j, p.factors[op.x])
-        else:
-            for (comp, wv, x) in p.embeddings[op.l]:
-                if wv is None:
-                    self.zero(list(self.edge(op.d, comp)))
-                else:
-                    component(comp, wv, p.factors[x])
 
 
 def simd_application(prog: Lowered, call=called) -> tuple[dict, dict]:
@@ -1088,10 +799,11 @@ def host_lanes() -> tuple[int, ...]:
 
 
 def runner_h(prog: Lowered, lanes: Sequence[int], mixed: bool = False) -> str:
-    if mixed:      # the f32 lanes: 8 (AVX2), 16 (AVX-512)
-        have = "#define PAC_SIMD_MIXED 1\n" + ("#define PAC_SIMD_HAVE16 1\n" if 8 in lanes else "")
-        what = f"kernel8.h: pac_simd8, AVX2{'; kernel16.h: pac_simd16, AVX-512' if 8 in lanes else ''}, mixed f32/df64; " \
-               "states the momenta's hi then lo parts, outputs the helicity outputs' hi then lo parts"
+    if mixed:      # the split kernels: A (f64) 4 / 8 lanes, B (f32) 8 / 16
+        have = "#define PAC_SIMD_SPLIT 1\n" + ("#define PAC_SIMD_HAVE16 1\n" if 8 in lanes else "")
+        what = "kernelA4.h, kernelB8.h: pac_split_a4, pac_split_b8, AVX2" \
+               f"{'; kernelA8.h, kernelB16.h: pac_split_a8, pac_split_b16, AVX-512' if 8 in lanes else ''}; A (f64): " \
+               "states the momenta, outputs the transfers; B (f32): states the transfers, outputs the helicity outputs"
     else:
         have = "#define PAC_SIMD_HAVE8 1\n" if 8 in lanes else ""
         what = f"kernel4.h: pac_simd4, AVX2{'; kernel8.h: pac_simd8, AVX-512' if 8 in lanes else ''}; states the " \
@@ -1114,12 +826,10 @@ def runner_h(prog: Lowered, lanes: Sequence[int], mixed: bool = False) -> str:
 
 def compile_simd(path, prog: Lowered, lanes: Optional[Sequence[int]] = None, precision: str = "f64"):
     """the folder of `prog` (see the module); returns `path`. `lanes`: the kernels, 4 and (where this CPU
-    has AVX-512, as symjit compiles it only there) 8; default host_lanes(). precision "mixed": the mixed
-    kernels (MixedAssembler, downgraded by simd/downgrade.py to f32 + df64: the Metal runner's bits), 8 and
-    16 lanes (kernel8.o pac_simd8, kernel16.o pac_simd16); kernel.json is then the f64 + double-double
-    application and kernel_roles.json its constants' roles"""
+    has AVX-512, as symjit compiles it only there) 8; default host_lanes(). precision "mixed": the split
+    kernels (compile_simd_split: kernel A in f64, kernel B in f32)"""
     if precision == "mixed":
-        return compile_simd_mixed(path, prog, lanes)
+        return compile_simd_split(path, prog, lanes)
     if precision != "f64":
         raise SimdError(f"precision {precision!r}: f64 or mixed")
     import symjit
@@ -1152,37 +862,41 @@ def compile_simd(path, prog: Lowered, lanes: Optional[Sequence[int]] = None, pre
     return path
 
 
-def compile_simd_mixed(path, prog: Lowered, lanes: Optional[Sequence[int]] = None):
-    """compile_simd(precision = "mixed")"""
+def compile_simd_split(path, prog: Lowered, lanes: Optional[Sequence[int]] = None):
+    """compile_simd(precision = "mixed"): the split kernels (codegen/compile_split.py): per lane count n
+    kernel A in f64 (kernelA<n>.o, pac_split_a<n>: the momenta to the transfers) and kernel B in f32
+    (kernelB<2n>.o, pac_split_b<2n>: the transfers to the outputs, downgraded); runner.h defines
+    PAC_SIMD_SPLIT (PAC_SIMD_HAVE16 with the AVX-512 pair)"""
     import symjit
     from ..simd import downgrade, elf
+    from .compile_split import split_applications
     lanes = tuple(host_lanes() if lanes is None else lanes)
     if 4 not in lanes:
         raise SimdError("device simd needs an x86-64 CPU with AVX2 and FMA to build on (symjit's JIT compiles the kernels)")
     path = Path(path)
     path.mkdir(parents=True, exist_ok=True)
-    a = MixedAssembler(prog)
-    app = a.assemble()
-    elf.no_relocations(app["mir"]["code"])
-    text = json.dumps(app)
-    (path / "kernel.json").write_text(text)
-    (path / "kernel_roles.json").write_text(json.dumps(a.roles))
+    app_a, app_b, roles, items = split_applications(prog)
+    for app in (app_a, app_b):
+        elf.no_relocations(app["mir"]["code"])
+    (path / "kernelA.json").write_text(json.dumps(app_a))
+    (path / "kernelB.json").write_text(json.dumps(app_b))
     (path / "runner.h").write_text(runner_h(prog, lanes, mixed=True))
-    codes = {}
-    for n in lanes:          # n: the f64 kernel's lanes; its f32 twin has 2 n
-        b = json.loads(text)
-        b["program"]["config"]["options"]["enable_simd512"] = n == 8
-        f = symjit.load_json(json.dumps(b))
-        f.dump(str(path / f"kernel{n}.bin"), "simd")
-        code = (path / f"kernel{n}.bin").read_bytes()
-        (path / f"kernel{n}.bin").unlink()
-        codes[n] = code
-        if n == 8 and code == codes.get(4):
-            raise SimdError("symjit compiled no AVX-512 kernel on this CPU")
-        code32 = downgrade.downgrade(code, consts=b["mir"]["consts"], roles=a.roles)
-        symbol = f"pac_simd{2 * n}"
-        (path / f"kernel{2 * n}.o").write_bytes(elf.elf_object(symbol, code32))
-        (path / f"kernel{2 * n}.h").write_text(elf.header(
-            symbol, 2 * n, b["program"]["count_states"], b["program"]["count_obs"], elf.stack_bytes(b, n),
-            f"{prog.process} {prog.colour}, mixed f32/df64 (float columns: element idx at byte 8 idx, call with idx / 2)"))
+    what = f"{prog.process} {prog.colour}"
+    for n in lanes:
+        for tag, app in (("a", app_a), ("b", app_b)):
+            b = json.loads(json.dumps(app))
+            b["program"]["config"]["options"]["enable_simd512"] = n == 8
+            f = symjit.load_json(json.dumps(b))
+            f.dump(str(path / "k.bin"), "simd")
+            code = (path / "k.bin").read_bytes()
+            (path / "k.bin").unlink()
+            m = n
+            if tag == "b":
+                code = downgrade.downgrade(code, consts=b["mir"]["consts"], roles=roles)
+                m = 2 * n
+            symbol = f"pac_split_{tag}{m}"
+            (path / f"kernel{tag.upper()}{m}.o").write_bytes(elf.elf_object(symbol, code))
+            (path / f"kernel{tag.upper()}{m}.h").write_text(elf.header(
+                symbol, m, b["program"]["count_states"], b["program"]["count_obs"], elf.stack_bytes(b, n),
+                what + (", split kernel A (f64)" if tag == "a" else ", split kernel B (f32: floats, call with idx / 2)")))
     return path

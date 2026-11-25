@@ -308,7 +308,7 @@ class Units(unittest.TestCase):
         self.assertEqual(_env.device_name("simd"), "simd")
         with mock.patch.object(_env.platform, "machine", lambda: "x86_64"):
             self.assertEqual(_env.compile_target("simd"), ("simd", "f64"))
-            self.assertEqual(_env.compile_target("simd", "mixed"), ("simd", "mixed"))   # the mixed kernels
+            self.assertEqual(_env.compile_target("simd", "mixed"), ("simd", "mixed"))   # the split kernels (f64 + f32)
             with self.assertRaisesRegex(_env.PacRunnerError, "needs a GPU device"):
                 _env.compile_target("cpu", "mixed")
         with mock.patch.object(_env.platform, "machine", lambda: "arm64"):

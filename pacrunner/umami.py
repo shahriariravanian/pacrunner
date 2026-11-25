@@ -300,9 +300,9 @@ def build_umami_simd(dir, lib: UmamiLibrary, l: Lowered, provider: dict, exporte
                      cc: Optional[str] = None, cflags: Flags = ("-O2",), precision: str = "f64") -> str:
     """build_umami_library for device "simd" (x86-64): compile_simd's folder (the permutation folded into the
     crossing; kernel4.o, the AVX2 kernel, and kernel8.o, the AVX-512 one, where this CPU has AVX-512) and
-    umami_pac.c with PAC_SIMD, linked with only the UMAMI functions exported. precision "mixed": the mixed
-    kernels (kernel8.o AVX2, kernel16.o AVX-512: f32 + df64, the Metal runner's arithmetic) and
-    PAC_SIMD_MIXED"""
+    umami_pac.c with PAC_SIMD, linked with only the UMAMI functions exported. precision "mixed": the split
+    kernels (kernel A in f64, kernel B in f32: kernelA4.o + kernelB8.o AVX2, kernelA8.o + kernelB16.o
+    AVX-512) and PAC_SIMD_SPLIT"""
     if not _env.simd_machine():
         raise UmamiError("device simd: x86-64 only (AVX2 and AVX-512 kernels)")
     if int(provider["particle_count"]) != l.legs:
@@ -324,10 +324,11 @@ def build_umami_simd(dir, lib: UmamiLibrary, l: Lowered, provider: dict, exporte
     exports.write_text("{ global: umami_*; local: *; };\n")
     hide = [f"-Wl,--version-script={exports}"] if sys.platform.startswith("linux") else []
     so = dir / f"libumami_pac.{SO}"
-    mixed = precision == "mixed"
-    objects = [dir / f"kernel{n}.o" for n in ((8, 16) if mixed else (4, 8)) if (dir / f"kernel{n}.o").is_file()]
+    names = ("kernelA4", "kernelB8", "kernelA8", "kernelB16") if precision == "mixed" else ("kernel4", "kernel8")
+    objects = [dir / f"{n}.o" for n in names if (dir / f"{n}.o").is_file()]
+    flag = ["-DPAC_SIMD_SPLIT"] if precision == "mixed" else []
     _run([*cc, *_flags(cflags), "-std=c99", "-ffp-contract=off", "-fPIC", "-fvisibility=hidden", "-DPAC_SIMD",
-          *(["-DPAC_SIMD_MIXED"] if mixed else []), "-shared", *hide, "-o", so, dir / "umami_pac.c", *objects, "-lm"])
+          *flag, "-shared", *hide, "-o", so, dir / "umami_pac.c", *objects, "-lm"])
     return str(so)
 
 
