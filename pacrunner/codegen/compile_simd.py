@@ -81,6 +81,19 @@ def G(n):
     return {"Gen": n}
 
 
+COPY_REGS = 4      # registers of a copy group: its loads, then its stores (no reuse of one register per copy)
+
+
+def copies(pairs, loc) -> list:
+    """MIR copying each (src, dst) of pairs, in groups of COPY_REGS registers"""
+    code = []
+    for g in range(0, len(pairs), COPY_REGS):
+        grp = pairs[g:g + COPY_REGS]
+        code += [{"Load": {"dst": G(r), "loc": loc(s)}} for r, (s, d) in enumerate(grp)]
+        code += [{"Save": {"loc": loc(d), "src": G(r)}} for r, (s, d) in enumerate(grp)]
+    return code
+
+
 def called(name: str) -> bool:
     """the fragments that are subroutines (the rest is inlined)"""
     return name.startswith(("vertex:", "propagator:", "wave:", "kernel:"))
@@ -313,9 +326,8 @@ class Assembler:
             scratch = [("scratch", j) for j in range(nout)]
             self.scratch_used = max(self.scratch_used, nout)
             self._splice(d, [inputs[n] for n in names] + scratch, check=False)
-            for j, t in enumerate(outputs):
-                self.load(0, ("scratch", j))
-                self.save(t, 0)
+            for c in copies(list(zip(scratch, outputs)), self.loc):
+                self.emit(c)
 
     def _splice(self, d, targets, check, dest=None, prefix=None):
         nin = len(d["inputs"])
@@ -740,9 +752,11 @@ class Assembler:
                         self.cslots.setdefault(ckey(s.inputs[n]), (len(self.cslots), s.inputs[n]))
         self.results = max((self.frag(n)["outputs"] for n in self.sites), default=0)
         code = []
-        for (i, x) in self.cslots.values():
-            code.append({"LoadConst": {"dst": G(0), "idx": self.const(x)}})
-            code.append({"Save": {"loc": self.loc(("cslot", i)), "src": G(0)}})
+        cs = list(self.cslots.values())
+        for g in range(0, len(cs), COPY_REGS):
+            grp = cs[g:g + COPY_REGS]
+            code += [{"LoadConst": {"dst": G(r), "idx": self.const(x)}} for r, (i, x) in enumerate(grp)]
+            code += [{"Save": {"loc": self.loc(("cslot", i)), "src": G(r)}} for r, (i, x) in enumerate(grp)]
         for item in self.code:
             if not isinstance(item, CallSite):
                 code.append(item)
@@ -754,9 +768,7 @@ class Assembler:
             code.append({"Call": {"label": self.label(item.name) + "_ultra", "num_args": 0}})
             if item.keep:
                 continue
-            for j, t in enumerate(item.outputs):
-                code.append({"Load": {"dst": G(0), "loc": self.loc(("result", j))}})
-                code.append({"Save": {"loc": self.loc(t), "src": G(0)}})
+            code += copies([(("result", j), t) for j, t in enumerate(item.outputs)], self.loc)
         bodies = []
         for name in sorted(self.sites):
             d = self.frag(name)
