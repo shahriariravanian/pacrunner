@@ -20,43 +20,98 @@ C_DIR = PACKAGE / "c"
 REPOSITORY = PACKAGE.parent
 
 
-DEVICES = ("cpu", "simd", "cuda", "cuda_provider", "metal")
-DEVICE_ALIASES = {"cuda_full": "cuda_provider"}   # cuda_full: everything on the GPU (MadSpace's GPU runtime)
-PRECISIONS = ("f64", "mixed")
+# the SIMD devices: one symjit kernel per program, for one instruction set (its f64 lanes)
+SIMD_DEVICES = {"simd-avx2": 4, "simd-avx512": 8, "simd-neon": 2}
+DEVICES = ("cpu", *SIMD_DEVICES, "cuda", "cuda_provider", "metal")
+# cuda_full: everything on the GPU (MadSpace's GPU runtime); simd: this machine's SIMD device (simd_device)
+DEVICE_ALIASES = {"cuda_full": "cuda_provider", "simd": None}
+# f64; mixed: a GPU's f32 currents (Metal: f32/df64); split: a SIMD device's split kernels (f64 + f32)
+PRECISIONS = ("f64", "mixed", "split")
 
 
 def device_name(device: str) -> str:
-    """a compile device's own name: an alias's target (cuda_full is cuda_provider), and "gpu" this
-    system's GPU with MadSpace on the CPU: metal on macOS, cuda elsewhere"""
+    """a compile device's own name: an alias's target (cuda_full is cuda_provider), "gpu" this
+    system's GPU with MadSpace on the CPU (metal on macOS, cuda elsewhere), "simd" this machine's SIMD
+    device (simd_device)"""
     if device == "gpu":
         return "metal" if sys.platform == "darwin" else "cuda"
-    return DEVICE_ALIASES.get(device, device)
+    if device == "simd":
+        return simd_device() or "simd"
+    return DEVICE_ALIASES.get(device) or device
 
 
 def compile_target(device: str, precision: str = "f64") -> tuple[str, str]:
     """(device, precision) of a build: the device's own name (device_name), and for metal always
-    "mixed" (Metal has no f64: mixed f32/df64); an unknown device or precision, metal off macOS, or simd
-    off x86-64, is a PacRunnerError"""
+    "mixed" (Metal has no f64: mixed f32/df64). A SIMD device's name may carry its precision
+    ("simd-avx2-split", "simd-split"); "mixed" on a SIMD device is "split" (its former name). An
+    unknown device or precision, metal off macOS, or a SIMD device this machine cannot build (symjit's
+    JIT compiles the kernels: simd_devices), is a PacRunnerError"""
+    if device.endswith("-split") and device != "-split":
+        device, precision = device[:-len("-split")], "split"
     name = device_name(device)
     if name not in DEVICES:
         raise PacRunnerError(f"device {device!r}: one of {', '.join(DEVICES)}, or gpu, "
-                             f"{', '.join(DEVICE_ALIASES)}")
+                             f"{', '.join(DEVICE_ALIASES)}, or a SIMD device with -split")
     if precision not in PRECISIONS:
         raise PacRunnerError(f"precision {precision!r}: one of {', '.join(PRECISIONS)}")
     if name == "metal":
         if sys.platform != "darwin":
             raise PacRunnerError(f"device {device!r} is metal (an Apple GPU): macOS only")
         return name, "mixed"
-    if name == "simd" and not simd_machine():
-        raise PacRunnerError(f"device {device!r}: x86-64 only (AVX2 and AVX-512 kernels; this is {platform.machine()})")
-    if precision != "f64" and name in ("cpu", "simd"):
-        raise PacRunnerError(f"precision {precision!r} needs a GPU device (cuda, cuda_provider, metal)")
+    if name in SIMD_DEVICES:
+        if name not in simd_devices():
+            here = ", ".join(simd_devices()) or "none"
+            raise PacRunnerError(f"device {name!r} does not build on this machine ({platform.machine()}; its SIMD "
+                                 f"devices: {here})")
+        if precision == "mixed":
+            precision = "split"
+        return name, precision
+    if precision == "split":
+        raise PacRunnerError(f"precision 'split' needs a SIMD device ({', '.join(SIMD_DEVICES)}, simd)")
+    if precision != "f64" and name == "cpu":
+        raise PacRunnerError(f"precision {precision!r} needs a GPU device (cuda, cuda_provider, metal) or a SIMD device")
     return name, precision
 
 
+def library_name(device: str, precision: str = "f64") -> str:
+    """the name of a build (compile_target's): its device, and its precision unless f64
+    ("simd-avx512-split", "cuda-mixed", "cpu")"""
+    device, precision = compile_target(device, precision)
+    return device if precision == "f64" else f"{device}-{precision}"
+
+
+def _cpu_flags() -> set:
+    try:
+        return set(Path("/proc/cpuinfo").read_text().split())
+    except OSError:
+        return set()
+
+
+def simd_devices() -> tuple[str, ...]:
+    """the SIMD devices that build on this machine (symjit's JIT compiles their kernels for this CPU):
+    simd-avx2 (an x86-64 CPU with AVX2 and FMA) and simd-avx512 (AVX-512 F and DQ as well), simd-neon
+    (aarch64: Linux or macOS)"""
+    machine = platform.machine().lower()
+    if machine in ("x86_64", "amd64"):
+        flags = _cpu_flags()
+        if not {"avx2", "fma"} <= flags:
+            return ()
+        return ("simd-avx2", "simd-avx512") if {"avx512f", "avx512dq"} <= flags else ("simd-avx2",)
+    if machine in ("aarch64", "arm64"):
+        return ("simd-neon",)
+    return ()
+
+
+def simd_device() -> str | None:
+    """this machine's SIMD device (the alias "simd"): simd-avx512 where the CPU has AVX-512, else
+    simd-avx2, simd-neon on aarch64; None without one"""
+    here = simd_devices()
+    return here[-1] if here else None
+
+
 def simd_machine() -> bool:
-    """whether device "simd" builds here: an x86-64 machine (its kernels are AVX2 and AVX-512 objects)"""
-    return platform.machine().lower() in ("x86_64", "amd64")
+    """whether a SIMD device builds here"""
+    return bool(simd_devices())
 
 
 def c_sources() -> Path:

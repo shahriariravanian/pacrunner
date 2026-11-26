@@ -15,7 +15,9 @@ result area of the called fragments. The rows:
     `@f_<name>_ultra` (SaveArgs ultra: the first 16 arguments passed as their stack slots' numbers,
     packed four to a register, and gathered into the argument area Stack(16 + k)), its outputs written
     to the result area and copied to their currents by the caller. A call site is LoadArgs (ultra),
-    Call, the copies. The body's inputs that are the same constant at every call site are constants
+    Call, the copies. An accumulation run (vertices adding into the current the call before wrote) is
+    chained: the run's calls leave the sum in the result area and the next takes it from there (its body
+    reads its old inputs at the result slots), so only the run's last call copies it out (Assembler.chain). The body's inputs that are the same constant at every call site are constants
     of the body; the per-row ones are stack slots filled at the start (ultra takes stack slots only).
     So the kernel's code stays small (straight-line code of a large program would be fetched from L3
     for every point: pacrunner's plans/CPU-KERNEL.md).
@@ -63,6 +65,11 @@ class SimdError(CompileError):
 
 def bits(x: float) -> str:
     return "0x%016x" % struct.unpack("<Q", struct.pack("<d", float(x)))[0]
+
+
+def ckey(x) -> object:
+    """a constant's key in the pool: its bits"""
+    return bits(x)
 
 
 def cmul(a: complex, b: complex) -> complex:
@@ -160,6 +167,13 @@ def kernel_fragment(k) -> dict:
 class CallSite:
     def __init__(self, name, inputs, outputs):
         self.name, self.inputs, self.outputs = name, inputs, outputs
+        self.keep = False       # chained: the outputs stay in the result area for the next call (no copies)
+
+
+def old_inputs(inputs) -> list:
+    """an add fragment's `old` inputs (old<j>.re, old<j>.im), in component order"""
+    olds = [n for n in inputs if n.startswith("old")]
+    return sorted(olds, key=lambda n: (int(n[3:].split(".")[0]), n.endswith(".im")))
 
 
 class Assembler:
@@ -179,14 +193,21 @@ class Assembler:
         self.results = 0
         self.bodies = []
         self.T = None
+        self.extra = 0          # slots after the arena (compile_split's kernel B: the transfers)
 
     # ---- slots and constants ----
     def const(self, x) -> int:
-        k = bits(x)
+        k = ckey(x)
         if k not in self.cidx:
             self.cidx[k] = len(self.consts)
-            self.consts.append(k)
+            self.consts.append(bits(x))
         return self.cidx[k]
+
+    def count_states(self) -> int:
+        return 4 * self.prog.legs
+
+    def count_obs(self) -> int:
+        return self.prog.output_count()
 
     def momentum(self, leg, j):
         return {"Mem": 4 * leg + j}
@@ -202,6 +223,9 @@ class Assembler:
         if kind == "arena":
             return {"Stack": base + i}
         base += self.b.size
+        if kind == "extra":
+            return {"Stack": base + i}
+        base += self.extra
         if kind == "scratch":
             return {"Stack": base + i}
         base += self.scratch_used
@@ -220,6 +244,10 @@ class Assembler:
             else:
                 self.frags[name] = library.fragment(name)
         return self.frags[name]
+
+    def row_factor(self, x) -> complex:
+        """the factor x of a scale, copy or scatter row"""
+        return self.prog.factors[x]
 
     # ---- raw MIR ----
     def emit(self, ins):
@@ -450,14 +478,14 @@ class Assembler:
         elif o == Opcode.CLEAR_AMPLITUDE:
             self.zero(list(self.amp(op.d)))
         elif o == Opcode.SCALE_ROW:          # c[j] = mul(f, c[j])
-            f = p.factors[op.x]
+            f = self.row_factor(op.x)
             for j in range(op.n):
                 re, im = self.edge(op.d, j)
                 self.cmul_const(re, im, f, a_first=False)
                 self.save(re, 0)
                 self.save(im, 1)
         elif o == Opcode.COPY:               # out[j] = src[j] × f (0 for a zero factor)
-            f = p.factors[op.x]
+            f = self.row_factor(op.x)
             n = p.edge_layout(op.d).components
             for j in range(n):
                 dre, dim = self.edge(op.d, j)
@@ -514,7 +542,7 @@ class Assembler:
     def scatter(self, op):
         """out[j] (mode)= scatter_value(src[j], f) with pacops' shortcuts (f is a constant)"""
         p = self.prog
-        f = p.factors[op.x]
+        f = self.row_factor(op.x)
         n = p.edge_layout(op.d).components
         for j in range(n):
             sre, sim = self.edge(op.l, j)
@@ -643,16 +671,62 @@ class Assembler:
             self.save(dim, 1)
 
     # ---- the calls ----
+    def chain(self) -> int:
+        """the accumulation runs: a call site whose old inputs are exactly the outputs of the call site before it
+        (nothing between the two calls; none of its other inputs among those outputs) takes them from the result
+        area, where that call left them (its result copies dropped: keep). Returns the number of chained sites."""
+        links, prev = 0, None
+        for item in self.code:
+            if not isinstance(item, CallSite):
+                prev = None
+                continue
+            olds = old_inputs(item.inputs)
+            if prev is not None and olds and [item.inputs[n] for n in olds] == prev.outputs \
+                    and not any(item.inputs[n] in prev.outputs for n in item.inputs if n not in olds):
+                prev.keep = True
+                for j, n in enumerate(olds):
+                    item.inputs[n] = ("result", j)
+                links += 1
+            prev = item
+        return links
+
+    def reads_old_first(self, name) -> bool:
+        """the body of fragment `name` reads its old inputs before it writes any output, so they can be its
+        result slots (a trial splice with the old inputs and the outputs on the same slots)"""
+        d = self.frag(name)
+        olds = old_inputs(d["inputs"])
+        targets = [("result", olds.index(n)) if n in olds else {"Mem": 1_000_000 + k} for k, n in enumerate(d["inputs"])]
+        targets += [("result", j) for j in range(d["outputs"])]
+        saved = self.consts, self.cidx, self.T
+        self.consts, self.cidx, self.T = list(self.consts), dict(self.cidx), self.T or 0
+        try:
+            return self._splice(d, targets, check=True, dest=[])
+        finally:
+            self.consts, self.cidx, self.T = saved
+
     def finish(self):
         """the call sites (LoadArgs ultra, Call, the result copies), the bodies after @success, the
-        per-row constant slots filled at the start"""
+        per-row constant slots filled at the start. The accumulation runs are chained (chain); a body whose
+        old inputs are the result slots at every call site, and reads them before writing, takes them there
+        (not as arguments)."""
+        self.links = self.chain()
         plans = {}
         for name, sites in self.sites.items():
             d = self.frag(name)
             baked, args = {}, []
+            in_place = None
             for n in d["inputs"]:
-                vals = {bits(s.inputs[n]) if isinstance(s.inputs[n], float) else None for s in sites}
-                if len(vals) == 1 and None not in vals:
+                vals = {ckey(s.inputs[n]) if isinstance(s.inputs[n], float) else
+                        s.inputs[n] if isinstance(s.inputs[n], tuple) and s.inputs[n][0] == "result" else None
+                        for s in sites}
+                if len(vals) == 1 and None not in vals and isinstance(sites[0].inputs[n], tuple):
+                    if in_place is None:
+                        in_place = self.reads_old_first(name)
+                    if in_place:
+                        baked[n] = sites[0].inputs[n]
+                    else:
+                        args.append(n)
+                elif len(vals) == 1 and None not in vals:
                     baked[n] = sites[0].inputs[n]
                 else:
                     args.append(n)
@@ -663,7 +737,7 @@ class Assembler:
             for s in sites:
                 for n in args:
                     if isinstance(s.inputs[n], float):
-                        self.cslots.setdefault(bits(s.inputs[n]), (len(self.cslots), s.inputs[n]))
+                        self.cslots.setdefault(ckey(s.inputs[n]), (len(self.cslots), s.inputs[n]))
         self.results = max((self.frag(n)["outputs"] for n in self.sites), default=0)
         code = []
         for (i, x) in self.cslots.values():
@@ -674,10 +748,12 @@ class Assembler:
                 code.append(item)
                 continue
             baked, args = plans[item.name]
-            locs = [self.loc(("cslot", self.cslots[bits(t)][0]) if isinstance(t, float) else t)
+            locs = [self.loc(("cslot", self.cslots[ckey(t)][0]) if isinstance(t, float) else t)
                     for t in (item.inputs[n] for n in args)]
             code.append({"LoadArgs": {"locs": locs, "complex": False, "ultra": True}})
             code.append({"Call": {"label": self.label(item.name) + "_ultra", "num_args": 0}})
+            if item.keep:
+                continue
             for j, t in enumerate(item.outputs):
                 code.append({"Load": {"dst": G(0), "loc": self.loc(("result", j))}})
                 code.append({"Save": {"loc": self.loc(t), "src": G(0)}})
@@ -704,7 +780,7 @@ class Assembler:
 
     def application(self):
         p = self.prog
-        stack = self.T + self.b.size + self.scratch_used + len(self.cslots) + self.results
+        stack = self.T + self.b.size + self.extra + self.scratch_used + len(self.cslots) + self.results
         cfg = library.config()
         opts = cfg["options"]
         opts.update({"use_threads": False, "fastmath": False, "compress": bool(self.bodies), "ultra": bool(self.bodies),
@@ -713,7 +789,7 @@ class Assembler:
         version = library.fragment(library.catalogue()[0])["symjit_version"]
         return {
             "format": "symjit-application", "format_version": 1, "symjit_version": version,
-            "program": {"config": cfg, "count_states": 4 * p.legs, "count_params": 0, "count_obs": p.output_count(),
+            "program": {"config": cfg, "count_states": self.count_states(), "count_params": 0, "count_obs": self.count_obs(),
                         "count_diffs": 0, "count_loops": 0,
                         "builder": {"consts": self.consts, "count_loops": 0, "count_stack": stack, "ft": []}},
             "prepared": {"compiled": True, "fast": False, "simd": False},
@@ -724,7 +800,28 @@ class Assembler:
     def stats(self) -> dict:
         return {"rows": len(self.prog.ops), "instructions": len(self.code) + len(self.bodies),
                 "bodies": len(self.bodies), "calls": sum(len(v) for v in self.sites.values()),
-                "constants": len(self.consts), "stack": self.T + self.b.size + self.scratch_used + len(self.cslots) + self.results}
+                "constants": len(self.consts),
+                "stack": self.T + self.b.size + self.extra + self.scratch_used + len(self.cslots) + self.results}
+
+
+# ---- f32 folding (the split kernels' kernel B: codegen/compile_split.py) --------------------------------
+
+def fl32(x: float) -> float:
+    """x rounded to f32 (to nearest)"""
+    return struct.unpack("<f", struct.pack("<f", float(x)))[0]
+
+
+def rf(z: complex) -> complex:
+    """a table value as the Metal runner's f32 copy (rscales, rfactors)"""
+    return complex(fl32(z.real), fl32(z.imag))
+
+
+def rmul32(a: complex, b: complex) -> complex:
+    """pacops.metal rmul in f32: each operation rounded once (in double, then to f32: correctly rounded,
+    a double holding more than twice a float's digits)"""
+    re = fl32(fl32(a.real * b.real) - fl32(a.imag * b.imag))
+    im = fl32(fl32(a.real * b.imag) + fl32(a.imag * b.real))
+    return complex(re, im)
 
 
 def simd_application(prog: Lowered, call=called) -> tuple[dict, dict]:
@@ -736,27 +833,42 @@ def simd_application(prog: Lowered, call=called) -> tuple[dict, dict]:
 
 # ---- the folder --------------------------------------------------------------------------------------------
 
-def host_lanes() -> tuple[int, ...]:
-    """the lane counts symjit's JIT compiles on this machine: 4 (AVX2 and FMA), and 8 where the CPU has
-    AVX-512 (symjit's use_simd512 asks for avx512f)"""
-    try:
-        flags = set(Path("/proc/cpuinfo").read_text().split())
-    except OSError:
-        flags = set()
-    out = ()
-    if "avx2" in flags and "fma" in flags:
-        out += (4,)
-        if "avx512f" in flags and "avx512dq" in flags:
-            out += (8,)
-    return out
+ISAS = {"simd-avx2": "avx2", "simd-avx512": "avx512", "simd-neon": "neon"}   # device -> instruction set
+LANES = {"avx2": 4, "avx512": 8, "neon": 2}                                 # its f64 lanes
+NEEDS = {"avx2": "an x86-64 CPU with AVX2 and FMA", "avx512": "an x86-64 CPU with AVX-512 (F, DQ)",
+         "neon": "an aarch64 CPU"}
 
 
-def runner_h(prog: Lowered, lanes: Sequence[int]) -> str:
-    have8 = "#define PAC_SIMD_HAVE8 1\n" if 8 in lanes else ""
+def host_isa() -> Optional[str]:
+    """the instruction set of this machine's SIMD device (_env.simd_device), or None"""
+    from .. import _env
+    d = _env.simd_device()
+    return ISAS[d] if d else None
+
+
+def _isa(isa: Optional[str]) -> str:
+    """`isa` (default host_isa()), checked against the SIMD devices this machine builds: symjit's JIT
+    compiles the kernels for its own CPU"""
+    from .. import _env
+    isa = isa or host_isa()
+    if isa not in LANES:
+        raise SimdError(f"no SIMD device on this machine ({', '.join(ISAS)}: {', '.join(NEEDS.values())})"
+                        if isa is None else f"instruction set {isa!r}: one of {', '.join(LANES)}")
+    if f"simd-{isa}" not in _env.simd_devices():
+        raise SimdError(f"device simd-{isa} needs {NEEDS[isa]} to build on (symjit's JIT compiles the kernels)")
+    return isa
+
+
+def runner_h(prog: Lowered, isa: str, split: bool = False) -> str:
+    n = LANES[isa]
+    if split:      # the split kernels: A (f64) n lanes, B (f32) 2 n
+        what = f"kernelA.h, kernelB.h: pac_kernel_a (f64, {n} lanes), pac_kernel_b (f32, {2 * n} lanes); A: states " \
+               "the momenta, outputs the transfers; B: states the transfers, outputs the helicity outputs"
+    else:
+        what = f"kernel.h: pac_kernel ({n} lanes); states the momenta, outputs the helicity outputs"
     return f"""\
-/* {prog.process} {prog.colour}: the program as SIMD kernels, by PacRunner's compile_simd
- * (kernel4.h: pac_simd4, AVX2{"; kernel8.h: pac_simd8, AVX-512" if 8 in lanes else ""}; states the momenta, outputs
- * the helicity outputs). */
+/* {prog.process} {prog.colour}: the program as SIMD kernels (simd-{isa}), by PacRunner's compile_simd
+ * ({what}). */
 #ifndef RUNNER_H
 #define RUNNER_H
 
@@ -765,39 +877,105 @@ def runner_h(prog: Lowered, lanes: Sequence[int]) -> str:
 #define RUNNER_LEGS {prog.legs}
 #define RUNNER_OUTPUTS {prog.output_count()}
 #define RUNNER_ARENA_SIZE {ArenaIndex.of(prog).size}
-{have8}
+#define PAC_SIMD_ISA_{isa.upper()} 1
+#define PAC_SIMD_DEVICE "simd-{isa}{'-split' if split else ''}"
+#define PAC_SIMD_NEEDS "{NEEDS[isa]}"
+{'#define PAC_SIMD_SPLIT 1' if split else ''}
 #endif
 """
 
 
-def compile_simd(path, prog: Lowered, lanes: Optional[Sequence[int]] = None):
-    """the folder of `prog` (see the module); returns `path`. `lanes`: the kernels, 4 and (where this CPU
-    has AVX-512, as symjit compiles it only there) 8; default host_lanes()"""
+# the instruction sets whose kernels call their subroutines in the plain convention (plain_calls)
+PLAIN_CALLS = {"neon"}
+
+
+def plain_calls(app: dict) -> dict:
+    """the application with its compress-mode calls in symjit's plain convention: ultra off, each LoadArgs
+    loading the argument values into vector registers, each Call to the body's plain entry (its SaveArgs
+    stores them to the argument area), instead of slot numbers packed 4 to an integer register. On aarch64
+    the packing costs a movz/movk per argument; plain calls run 7-11% fewer instructions, 1-3% faster on
+    the M4 (plans/pacrunner-python/F32-KERNEL.md)"""
+    a = json.loads(json.dumps(app))
+    a["program"]["config"]["options"]["ultra"] = False
+    for ins in a["mir"]["code"]:
+        if isinstance(ins, dict) and "LoadArgs" in ins:
+            ins["LoadArgs"]["ultra"] = False
+        if isinstance(ins, dict) and "Call" in ins and ins["Call"]["label"].endswith("_ultra"):
+            ins["Call"]["label"] = ins["Call"]["label"][:-len("_ultra")]
+    return a
+
+
+def jit_kernel(app: dict, isa: str, what: str, folder) -> bytes:
+    """the SIMD kernel of `app` for `isa` from symjit's JIT: `dump(.., what)`, "simd" or "simd-f32" (its
+    f32 twin: symjit >= 2.29.2)"""
     import symjit
+    a = json.loads(json.dumps(app))
+    a["program"]["config"]["options"]["enable_simd512"] = isa == "avx512"
+    f = symjit.load_json(json.dumps(a))
+    path = Path(folder) / "k.bin"
+    try:
+        f.dump(str(path), what)
+    except ValueError as e:
+        if what == "simd-f32":
+            raise SimdError(f"symjit {getattr(symjit, '__version__', '')} cannot dump an f32 kernel (simd-f32: "
+                            "symjit >= 2.29.2; its error, if any, is on stderr)") from e
+        raise SimdError(f"symjit dumps no SIMD kernel: {e}") from e
+    code = path.read_bytes()
+    path.unlink()
+    return code
+
+
+def compile_simd(path, prog: Lowered, isa: Optional[str] = None, precision: str = "f64"):
+    """the folder of `prog` (see the module) for the instruction set `isa` ("avx2", "avx512", "neon";
+    default host_isa()); returns `path`. The kernel: kernel.o (x86-64) or kernel.S + kernel.bin (aarch64),
+    pac_kernel, kernel.h. precision "split": the split kernels (compile_simd_split)"""
+    if precision in ("split", "mixed"):
+        return compile_simd_split(path, prog, isa)
+    if precision != "f64":
+        raise SimdError(f"precision {precision!r}: f64 or split")
     from ..simd import elf
-    lanes = tuple(host_lanes() if lanes is None else lanes)
-    if 4 not in lanes:
-        raise SimdError("device simd needs an x86-64 CPU with AVX2 and FMA to build on (symjit's JIT compiles the kernels)")
+    isa = _isa(isa)
     path = Path(path)
     path.mkdir(parents=True, exist_ok=True)
     app, _ = simd_application(prog)
+    if isa in PLAIN_CALLS:
+        app = plain_calls(app)
     elf.no_relocations(app["mir"]["code"])
-    text = json.dumps(app)
-    (path / "kernel.json").write_text(text)
-    (path / "runner.h").write_text(runner_h(prog, lanes))
-    codes = {}
-    for n in lanes:
-        a = json.loads(text)
-        a["program"]["config"]["options"]["enable_simd512"] = n == 8
-        f = symjit.load_json(json.dumps(a))
-        f.dump(str(path / f"kernel{n}.bin"), "simd")
-        code = (path / f"kernel{n}.bin").read_bytes()
-        (path / f"kernel{n}.bin").unlink()
-        codes[n] = code
-        if n == 8 and code == codes.get(4):   # symjit gave its AVX2 kernel: no AVX-512 here
-            raise SimdError("symjit compiled no AVX-512 kernel on this CPU")
-        symbol = f"pac_simd{n}"
-        (path / f"kernel{n}.o").write_bytes(elf.elf_object(symbol, code))
-        (path / f"kernel{n}.h").write_text(elf.header(symbol, n, a["program"]["count_states"], a["program"]["count_obs"],
-                                                      elf.stack_bytes(a, n), f"{prog.process} {prog.colour}"))
+    (path / "kernel.json").write_text(json.dumps(app))
+    (path / "runner.h").write_text(runner_h(prog, isa))
+    code = jit_kernel(app, isa, "simd", path)
+    elf.write_object(path, "kernel", "pac_kernel", code, isa)
+    n = LANES[isa]
+    (path / "kernel.h").write_text(elf.header("pac_kernel", n, app["program"]["count_states"], app["program"]["count_obs"],
+                                              elf.stack_bytes(app, n), f"{prog.process} {prog.colour}, simd-{isa}"))
+    return path
+
+
+def compile_simd_split(path, prog: Lowered, isa: Optional[str] = None):
+    """compile_simd(precision = "split"): the split kernels (codegen/compile_split.py) for `isa`: kernel A
+    in f64 (kernelA, pac_kernel_a: the momenta to the transfers, its f64 lanes) and kernel B in f32
+    (kernelB, pac_kernel_b: the transfers to the outputs, twice the lanes: symjit's f32 twin of its f64
+    kernel, `dump(.., "simd-f32")`); runner.h defines PAC_SIMD_SPLIT"""
+    from ..simd import elf
+    from .compile_split import split_applications
+    isa = _isa(isa)
+    path = Path(path)
+    path.mkdir(parents=True, exist_ok=True)
+    app_a, app_b, _, items = split_applications(prog)
+    if isa in PLAIN_CALLS:
+        app_a, app_b = plain_calls(app_a), plain_calls(app_b)
+    for app in (app_a, app_b):
+        elf.no_relocations(app["mir"]["code"])
+    (path / "kernelA.json").write_text(json.dumps(app_a))
+    (path / "kernelB.json").write_text(json.dumps(app_b))
+    (path / "runner.h").write_text(runner_h(prog, isa, split=True))
+    what = f"{prog.process} {prog.colour}, simd-{isa}-split"
+    n = LANES[isa]
+    for tag, app, dump, m in (("A", app_a, "simd", n), ("B", app_b, "simd-f32", 2 * n)):
+        code = jit_kernel(app, isa, dump, path)
+        symbol = f"pac_kernel_{tag.lower()}"
+        elf.write_object(path, f"kernel{tag}", symbol, code, isa)
+        (path / f"kernel{tag}.h").write_text(elf.header(
+            symbol, m, app["program"]["count_states"], app["program"]["count_obs"], elf.stack_bytes(app, n),
+            what + (", kernel A (f64)" if tag == "A" else ", kernel B (f32: floats, call with idx / 2)")))
     return path

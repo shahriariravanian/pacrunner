@@ -5,7 +5,8 @@
 //
 // shim_run(program.bin, momenta[point][4 legs], points, out[point][outputs]): the momenta staged as
 // df64 in the launch layout the Metal host uses (row 4 leg + j, points per row), the outputs read
-// back as hi + lo. Returns the status (0, or a failing kernel's).
+// back as hi + lo. Returns the status (0, or a failing kernel's). Built with -DSHIM_KEEP_DENORMALS, f32
+// denormals are not flushed (the CPU's arithmetic, for the mixed SIMD kernels).
 
 #include <vector>       // before msl_shim.h: its MSL keywords (thread, device, ...) are empty macros
 #include "msl_shim.h"
@@ -13,7 +14,9 @@
 
 extern "C" int shim_run(const unsigned char *program, const double *momenta, size_t points, double *out)
 {
+#ifndef SHIM_KEEP_DENORMALS   // the CPU's mixed kernels (test_mixed.py) keep f32 denormals
     msl_shim_flush_denormals();
+#endif
     const uir_header *h = (const uir_header *)program;
     size_t legs = h->legs, forms = h->forms, planes = h->planes, amplitudes = h->amplitudes, outputs = h->outputs;
     std::vector<float2> m(4 * legs * points + 1), o(outputs * points + 1), f(4 * forms * points + 1),
