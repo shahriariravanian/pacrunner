@@ -15,7 +15,9 @@ result area of the called fragments. The rows:
     `@f_<name>_ultra` (SaveArgs ultra: the first 16 arguments passed as their stack slots' numbers,
     packed four to a register, and gathered into the argument area Stack(16 + k)), its outputs written
     to the result area and copied to their currents by the caller. A call site is LoadArgs (ultra),
-    Call, the copies. The body's inputs that are the same constant at every call site are constants
+    Call, the copies. An accumulation run (vertices adding into the current the call before wrote) is
+    chained: the run's calls leave the sum in the result area and the next takes it from there (its body
+    reads its old inputs at the result slots), so only the run's last call copies it out (Assembler.chain). The body's inputs that are the same constant at every call site are constants
     of the body; the per-row ones are stack slots filled at the start (ultra takes stack slots only).
     So the kernel's code stays small (straight-line code of a large program would be fetched from L3
     for every point: pacrunner's plans/CPU-KERNEL.md).
@@ -165,6 +167,13 @@ def kernel_fragment(k) -> dict:
 class CallSite:
     def __init__(self, name, inputs, outputs):
         self.name, self.inputs, self.outputs = name, inputs, outputs
+        self.keep = False       # chained: the outputs stay in the result area for the next call (no copies)
+
+
+def old_inputs(inputs) -> list:
+    """an add fragment's `old` inputs (old<j>.re, old<j>.im), in component order"""
+    olds = [n for n in inputs if n.startswith("old")]
+    return sorted(olds, key=lambda n: (int(n[3:].split(".")[0]), n.endswith(".im")))
 
 
 class Assembler:
@@ -662,16 +671,62 @@ class Assembler:
             self.save(dim, 1)
 
     # ---- the calls ----
+    def chain(self) -> int:
+        """the accumulation runs: a call site whose old inputs are exactly the outputs of the call site before it
+        (nothing between the two calls; none of its other inputs among those outputs) takes them from the result
+        area, where that call left them (its result copies dropped: keep). Returns the number of chained sites."""
+        links, prev = 0, None
+        for item in self.code:
+            if not isinstance(item, CallSite):
+                prev = None
+                continue
+            olds = old_inputs(item.inputs)
+            if prev is not None and olds and [item.inputs[n] for n in olds] == prev.outputs \
+                    and not any(item.inputs[n] in prev.outputs for n in item.inputs if n not in olds):
+                prev.keep = True
+                for j, n in enumerate(olds):
+                    item.inputs[n] = ("result", j)
+                links += 1
+            prev = item
+        return links
+
+    def reads_old_first(self, name) -> bool:
+        """the body of fragment `name` reads its old inputs before it writes any output, so they can be its
+        result slots (a trial splice with the old inputs and the outputs on the same slots)"""
+        d = self.frag(name)
+        olds = old_inputs(d["inputs"])
+        targets = [("result", olds.index(n)) if n in olds else {"Mem": 1_000_000 + k} for k, n in enumerate(d["inputs"])]
+        targets += [("result", j) for j in range(d["outputs"])]
+        saved = self.consts, self.cidx, self.T
+        self.consts, self.cidx, self.T = list(self.consts), dict(self.cidx), self.T or 0
+        try:
+            return self._splice(d, targets, check=True, dest=[])
+        finally:
+            self.consts, self.cidx, self.T = saved
+
     def finish(self):
         """the call sites (LoadArgs ultra, Call, the result copies), the bodies after @success, the
-        per-row constant slots filled at the start"""
+        per-row constant slots filled at the start. The accumulation runs are chained (chain); a body whose
+        old inputs are the result slots at every call site, and reads them before writing, takes them there
+        (not as arguments)."""
+        self.links = self.chain()
         plans = {}
         for name, sites in self.sites.items():
             d = self.frag(name)
             baked, args = {}, []
+            in_place = None
             for n in d["inputs"]:
-                vals = {ckey(s.inputs[n]) if isinstance(s.inputs[n], float) else None for s in sites}
-                if len(vals) == 1 and None not in vals:
+                vals = {ckey(s.inputs[n]) if isinstance(s.inputs[n], float) else
+                        s.inputs[n] if isinstance(s.inputs[n], tuple) and s.inputs[n][0] == "result" else None
+                        for s in sites}
+                if len(vals) == 1 and None not in vals and isinstance(sites[0].inputs[n], tuple):
+                    if in_place is None:
+                        in_place = self.reads_old_first(name)
+                    if in_place:
+                        baked[n] = sites[0].inputs[n]
+                    else:
+                        args.append(n)
+                elif len(vals) == 1 and None not in vals:
                     baked[n] = sites[0].inputs[n]
                 else:
                     args.append(n)
@@ -697,6 +752,8 @@ class Assembler:
                     for t in (item.inputs[n] for n in args)]
             code.append({"LoadArgs": {"locs": locs, "complex": False, "ultra": True}})
             code.append({"Call": {"label": self.label(item.name) + "_ultra", "num_args": 0}})
+            if item.keep:
+                continue
             for j, t in enumerate(item.outputs):
                 code.append({"Load": {"dst": G(0), "loc": self.loc(("result", j))}})
                 code.append({"Save": {"loc": self.loc(t), "src": G(0)}})
