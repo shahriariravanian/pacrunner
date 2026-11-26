@@ -180,8 +180,9 @@ class Assembler:
     """one program's kernel (see the module): rows() walks the program as compile.py's compile_op,
     finish() lays out the calls and the bodies, application() is the JSON"""
 
-    def __init__(self, prog: Lowered, call=called):
+    def __init__(self, prog: Lowered, call=called, isa: Optional[str] = None):
         validate(prog)
+        self.isa = isa          # the fragments: lib_hand_<isa>/'s (library.fragment), lib/'s for None
         self.prog, self.b = prog, ArenaIndex.of(prog)
         self.code, self.consts, self.cidx = [], [], {}
         self.frags = {}
@@ -242,7 +243,7 @@ class Assembler:
                 k = next(s.kernel for s in self.prog.stubs if s.kernel.sha256 == name[len("kernel:"):])
                 self.frags[name] = kernel_fragment(k)
             else:
-                self.frags[name] = library.fragment(name)
+                self.frags[name] = library.fragment(name, self.isa)
         return self.frags[name]
 
     def row_factor(self, x) -> complex:
@@ -824,9 +825,10 @@ def rmul32(a: complex, b: complex) -> complex:
     return complex(re, im)
 
 
-def simd_application(prog: Lowered, call=called) -> tuple[dict, dict]:
-    """the program's kernel as a symjit-application (JSON as a dict), and its sizes"""
-    a = Assembler(prog, call)
+def simd_application(prog: Lowered, call=called, isa: Optional[str] = None) -> tuple[dict, dict]:
+    """the program's kernel as a symjit-application (JSON as a dict), and its sizes; for `isa`: its
+    hand-compiled fragments (lib_hand_<isa>/), lib/'s for None"""
+    a = Assembler(prog, call, isa)
     app = a.assemble()
     return app, a.stats()
 
@@ -937,7 +939,7 @@ def compile_simd(path, prog: Lowered, isa: Optional[str] = None, precision: str 
     isa = _isa(isa)
     path = Path(path)
     path.mkdir(parents=True, exist_ok=True)
-    app, _ = simd_application(prog)
+    app, _ = simd_application(prog, isa=isa)
     if isa in PLAIN_CALLS:
         app = plain_calls(app)
     elf.no_relocations(app["mir"]["code"])
@@ -961,7 +963,7 @@ def compile_simd_split(path, prog: Lowered, isa: Optional[str] = None):
     isa = _isa(isa)
     path = Path(path)
     path.mkdir(parents=True, exist_ok=True)
-    app_a, app_b, _, items = split_applications(prog)
+    app_a, app_b, _, items = split_applications(prog, isa)
     if isa in PLAIN_CALLS:
         app_a, app_b = plain_calls(app_a), plain_calls(app_b)
     for app in (app_a, app_b):
