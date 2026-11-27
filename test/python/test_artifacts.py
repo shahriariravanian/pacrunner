@@ -91,7 +91,8 @@ class Artifact(unittest.TestCase):
         self.assertTrue(all(a.flavours(c) >= 1 for c in range(a.channels)))
         points = a.validation_points()
         self.assertTrue(points and all(p.shape == (a.particle_count, 4) for _, p in points))
-        self.assertIn("alpha_s", a.parameters)
+        # the model's name for it: "alpha_s" (pyAmpliCol's models), "aS" (UFO models, MadGraph7 outputs)
+        self.assertIn(a.metadata["provider"].get("alpha_s_parameter", "alpha_s"), a.parameters)
 
     def test_compile_is_the_stock_library(self):
         a = self.a
