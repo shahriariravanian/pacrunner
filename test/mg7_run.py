@@ -3,14 +3,15 @@ changing MadGraph7: the AmplicolSubprocess class is replaced, in this process on
 loads the libraries of umami_libraries (one per program, flavour 0) and lets MadSpace split each
 batch by flavour (one DifferentialCrossSection per library of the UMAMI channel).
 
-  python mg7_run.py prepare OUTPUT [--device cpu|simd-avx2|simd-avx512|simd-neon|simd|cuda|cuda_provider|metal]
+  python mg7_run.py prepare OUTPUT [--device cpu|cpu-jit|simd-avx2|simd-avx512|simd-neon|simd|cuda|cuda_provider|metal]
                                    [--precision f64|mixed|split] [--python PYTHON]
       the recurrence export of every SubProcesses/*/lc artifact and, per UMAMI provider, the
       libraries in OUTPUT/lib/pacrunner[-<build>]/<name>_<provider>/umami_pac.json, <build> the device and
       its precision (python -m pacrunner.umami --target: simd-avx512-split, cuda-mixed, ...; metal: macOS,
       always mixed f32/df64; its libraries are CPU providers, run with run.device = ["cpu"]; the SIMD
       devices: one symjit kernel per program for AVX2, AVX-512 or NEON, simd this machine's, precision
-      split the f64 + f32 kernels, also as a device name: --device simd-neon-split)
+      split the f64 + f32 kernels, also as a device name: --device simd-neon-split; cpu-jit: the SIMD device's
+      kernel as symjit's scalar code, the cpu runner's bits)
   python mg7_run.py run OUTPUT [--device cpu|<build>|simd|simd-split|stock] [generate_events arguments, default -f]
       bin/generate_events with the replaced subprocess class (stock libraries still built: the
       full-colour pass keeps the stock ratio library); PAC_UMAMI_TIMER=LOG times every call of the

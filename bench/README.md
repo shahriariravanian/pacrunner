@@ -21,6 +21,7 @@ the machine and revisions in `machine.txt` beside it. All paths and the pythons:
 | --- | --- | --- |
 | `stock` | the output's stock pyAmpliCol library | cpu, full |
 | `cpu` | `cpu`, f64 | cpu, full |
+| `cpu-jit` | `cpu-jit`, f64: the SIMD device's kernel as symjit's scalar code (`cpu`'s bits) | cpu, full |
 | `simd-avx2` / `simd-neon` | `simd-avx2` / `simd-neon`, f64 | cpu, full |
 | `simd-split-avx2` / `simd-split-neon` | the same, `split` (f64 kernel A, f32 kernel B) | cpu, full |
 | `simd-avx512`, `simd-split-avx512` | `simd-avx512`, f64 / `split` (x86-64 with AVX-512) | cpu, full |
@@ -37,4 +38,4 @@ so a GPU variant's includes threads waiting for the shared GPU); C, for `cuda-fu
 once queued on MadSpace's stream: its libraries on synchronized 64k-event batches
 (`test/bench_libraries.py`, best of 5), marked `*` in the table. The table also gives each variant's
 cross section against stock's and whether its events are stock's or `cpu`'s bit for bit (the f64 SIMD
-devices give `cpu`'s).
+devices and `cpu-jit` give `cpu`'s).

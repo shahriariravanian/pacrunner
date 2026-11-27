@@ -137,6 +137,13 @@ kernel (`dump(.., "simd-f32")`: the machine code rewritten instruction by instru
 faster than f64 on x86-64 (more with model kernels and many propagators). The precision's former name, `mixed`,
 is accepted on a SIMD device.
 
+`compile(device="cpu-jit")` is the CPU runner made by symjit instead of the C compiler: the SIMD device's kernel
+of each program (the application of `simd-avx2` on x86-64, of `simd-neon` on aarch64: the same fragments,
+subroutines and chained runs) as symjit's scalar code, one event per kernel call, in the same UMAMI layer. f64,
+the `cpu` provider's bits; it builds where a SIMD device does. It runs fewer instructions than the C runner (no
+generic `vertex()` and its dispatch) but its code is larger: on a Ryzen 9900X it is 0.8× of `cpu` for small
+programs and 1.3× for large ones (`d d~ > z + 5 g`, one flow); on the M4 0.86–0.98× of `cpu`.
+
 For now, let's continue with generating CUDA providers. 
 PacRunner currently supports two types of GPU backend: `compile(device="cuda")` and `compile(device="cuda_provider")`
 (also called `device="cuda_full"`: everything on the GPU). 

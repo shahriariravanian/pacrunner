@@ -137,10 +137,12 @@ def write_object(folder, stem: str, symbol: str, code: bytes, isa: str) -> str:
 def header(symbol: str, lanes: int, count_states: int, count_obs: int, stack: int, what: str) -> str:
     """the C header of a kernel object"""
     up = symbol.upper()
+    kind = "symjit's scalar kernel" if lanes == 1 else "symjit's SIMD kernel"
+    shape = "A scalar kernel (1 lane)" if lanes == 1 else f"A SIMD kernel of {lanes} lanes"
     return f"""\
-/* {symbol}: {what}, as an object by PacRunner (symjit's SIMD kernel, simd/elf.py).
+/* {symbol}: {what}, as an object by PacRunner ({kind}, simd/elf.py).
 
-   A SIMD kernel of {lanes} lanes, indirect mode: `states` points to {up}_COUNT_STATES + {up}_COUNT_OBS
+   {shape}, indirect mode: `states` points to {up}_COUNT_STATES + {up}_COUNT_OBS
    arrays (symjit_slice: the states, then the outputs); {symbol}(NULL, states, i, NULL) reads elements
    i .. i + {up}_LANES - 1 of each state array and writes those of each output array (every array holds
    a multiple of {up}_LANES elements). It returns 0. A call uses up to {up}_STACK_BYTES bytes of the
