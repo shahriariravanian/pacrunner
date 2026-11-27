@@ -24,6 +24,10 @@ Known differences from pacops (none in any test): Julia's max/min of a NaN (jmax
 min(0.0, -0.0) (0.0 here, -0.0 in pacops), copysign(sqh, -0.0) at pt = 0 (+ here).
 
     python -m pacrunner.simd.library        regenerates lib/ (needs symjit >= 2.29)
+
+The vertices, propagators and closures also come hand-compiled per instruction set, lib_hand_<isa>/
+(simd/handgen.py: the same trees and order of operations, lib/'s bits, the ISA's registers): fragment(name, isa)
+takes them for a kernel of that ISA; PACRUNNER_SIMD_LIB=lib keeps lib/'s.
 """
 from __future__ import annotations
 
@@ -33,6 +37,16 @@ import sys
 from pathlib import Path
 
 LIB = Path(__file__).with_name("lib")
+HAND_ISAS = ("avx2", "avx512", "neon")
+HAND_KINDS = ("vertex:", "propagator:", "closure:")      # the fragments handgen.py compiles
+
+
+def hand_dir(isa: str) -> Path:
+    return LIB.with_name(f"lib_hand_{isa}")
+
+
+def hand_compiled(name: str) -> bool:
+    return name.startswith(HAND_KINDS)
 FORMAT = "pacrunner-simd-fragment"
 FORMAT_VERSION = 1
 
@@ -436,8 +450,18 @@ def compile_fragment(name):
 _cache: dict = {}
 
 
-def fragment(name: str) -> dict:
-    """the shipped fragment `name` (lib/), cached"""
+def fragment(name: str, isa: str | None = None) -> dict:
+    """the shipped fragment `name`, cached: lib_hand_<isa>/'s for a kernel of `isa` (a hand-compiled kind, unless
+    PACRUNNER_SIMD_LIB=lib), else lib/'s"""
+    if isa in HAND_ISAS and hand_compiled(name) and os.environ.get("PACRUNNER_SIMD_LIB", "auto") != "lib":
+        key = (isa, name)
+        if key not in _cache:
+            path = hand_dir(isa) / file_of(name).name
+            if not path.is_file():
+                raise LibraryError(f"no hand-compiled fragment {name!r} for {isa} ({path}); regenerate them: "
+                                   "python -m pacrunner.simd.handgen")
+            _cache[key] = json.loads(path.read_text())
+        return _cache[key]
     if name not in _cache:
         path = file_of(name)
         if not path.is_file():

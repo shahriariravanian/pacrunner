@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import math
 import struct
+from typing import Optional
 
 from ..simd import split_kernel
 from ..simd.mir import Mir, Val
@@ -163,8 +164,8 @@ def a_called(name: str) -> bool:
 class SplitA(Assembler):
     """kernel A (f64): the forms, then each transfer into its output"""
 
-    def __init__(self, prog: Lowered, plan: Plan):
-        super().__init__(prog, a_called)
+    def __init__(self, prog: Lowered, plan: Plan, isa: Optional[str] = None):
+        super().__init__(prog, a_called, isa)
         self.plan = plan
 
     def count_obs(self) -> int:
@@ -243,8 +244,8 @@ class SplitA(Assembler):
 class SplitB(Assembler):
     """kernel B (f32: symjit's f32 twin of it): the rows on the transfers, every constant folded in f32"""
 
-    def __init__(self, prog: Lowered, plan: Plan):
-        super().__init__(prog, called)
+    def __init__(self, prog: Lowered, plan: Plan, isa: Optional[str] = None):
+        super().__init__(prog, called, isa)
         self.plan = plan
         self.extra = len(plan.items)    # the transfers copied to Stack slots: a subroutine's arguments
                                         # are slot numbers (LoadArgs ultra), not Mem
@@ -426,14 +427,14 @@ class SplitB(Assembler):
             self.save(dim, 1)
 
 
-def split_applications(prog: Lowered):
+def split_applications(prog: Lowered, isa: Optional[str] = None):
     """(A's application, B's application, the B constants' f32 check, the transfers). symjit's f32
     twin of B (`dump(.., "simd-f32")`) rounds its constants to f32: they are f32 values already (folded
     in f32), checked here, so that the rounding changes none"""
     plan = Plan(prog)
-    a = SplitA(prog, plan)
+    a = SplitA(prog, plan, isa)
     app_a = a.assemble()
-    b = SplitB(prog, plan)
+    b = SplitB(prog, plan, isa)
     app_b = b.assemble()
     for c in app_b["mir"]["consts"]:
         x = struct.unpack("<d", struct.pack("<Q", int(c, 16)))[0]
