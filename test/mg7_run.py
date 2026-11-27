@@ -255,13 +255,14 @@ def run(output, args, device="cpu"):
     sys.path.append(mg5_dir(output))
     from madgraph.mg7 import bootstrap
     bootstrap.ensure_madspace(interactive=False)  # MadGraph7's madspace first on sys.path
-    if device.startswith("cuda_provider"):
+    build = "stock" if device == "stock" else build_name(device)   # an alias resolved: cuda_full is cuda_provider
+    if build.startswith("cuda_provider"):
         # MadSpace built with CUDA (ENABLE_CUDA) beside the CPU build: madspace/install-cuda
         cuda = os.path.join(mg5_dir(output), "madspace", "install-cuda")
         if not os.path.isdir(os.path.join(cuda, "madspace")):
             sys.exit(f"--device {device} needs a CUDA build of MadSpace in {cuda}")
         sys.path.insert(0, cuda)
-    install_stock(output) if device == "stock" else install(output, build_name(device))
+    install_stock(output) if device == "stock" else install(output, build)
     from madgraph.mg7.launch import main
     os.chdir(output)
     sys.argv = [os.path.join(output, "bin", "generate_events")] + (args or ["-f"])
