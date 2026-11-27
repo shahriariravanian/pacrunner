@@ -13,7 +13,7 @@ import sys
 import numpy as np
 
 L = sys.argv[1]
-ORDER = ["stock", "cpu", "simd-avx2", "simd-neon", "simd-split-avx2", "simd-split-neon", "simd-avx512",
+ORDER = ["stock", "cpu", "cpu-jit", "simd-avx2", "simd-neon", "simd-split-avx2", "simd-split-neon", "simd-avx512",
          "simd-split-avx512", "cuda-f64", "cuda-mixed", "metal-mixed", "cuda-full-f64", "cuda-full-mixed"]
 
 

@@ -29,6 +29,9 @@ where the CPU has AVX-512, else simd-avx2; simd-neon on aarch64): the program as
 an object file), 4, 8 or 2 events per kernel call; the library a CPU provider with the CPU build's bits
 (umami_pac.c, PAC_SIMD). precision "split" (a SIMD device; "simd-avx2-split" and so on): the split kernels,
 kernel A in f64 and kernel B in f32 (symjit's f32 twin, twice the lanes).
+device "cpu-jit": the CPU runner made by symjit: the SIMD device's kernel of the program (simd-avx2's application on
+x86-64, simd-neon's on aarch64) as symjit's scalar code, one event per kernel call, in the same wrapper; f64, the
+cpu runner's bits (compile_simd(..., scalar=True)).
 
 The programs come from RustiCol's recurrence export (uir.load_recurrence_export) of the same artifact,
 with the same model parameters: a library refuses other values (umami_set_parameter).
@@ -63,6 +66,7 @@ DEVICE_ALIASES = _env.DEVICE_ALIASES          # cuda_full: all on the GPU (MadSp
 PRECISIONS = _env.PRECISIONS                  # a CUDA device: mixed is pacops.h's PAC_MIXED
 GPU_DEVICES = ("cuda", "cuda_provider", "metal")
 SIMD_DEVICES = tuple(_env.SIMD_DEVICES)
+CPU_JIT = _env.CPU_JIT                         # the scalar kernel of a SIMD device's application
 SO = "dylib" if sys.platform == "darwin" else "so"
 
 Flags = Union[str, Sequence[str]]
@@ -302,10 +306,10 @@ def build_umami_metal(dir, lib: UmamiLibrary, l: Lowered, provider: dict, export
 def build_umami_simd(dir, lib: UmamiLibrary, l: Lowered, provider: dict, exported_count: int, parameters, *,
                      cc: Optional[str] = None, cflags: Flags = ("-O2",), device: str = "simd-avx2",
                      precision: str = "f64") -> str:
-    """build_umami_library for a SIMD device (simd-avx2, simd-avx512, simd-neon): compile_simd's folder for its
-    instruction set (the permutation folded into the crossing; the kernel as kernel.o, x86-64, or kernel.S,
-    aarch64) and umami_pac.c with PAC_SIMD, linked with only the UMAMI functions exported. precision "split":
-    the split kernels (kernelA, kernelB) and PAC_SIMD_SPLIT"""
+    """build_umami_library for a SIMD device (simd-avx2, simd-avx512, simd-neon) or cpu-jit: compile_simd's folder
+    for its instruction set (the permutation folded into the crossing; the kernel as kernel.o, x86-64, or kernel.S,
+    aarch64; cpu-jit: the scalar kernel, compile_simd(..., scalar=True)) and umami_pac.c with PAC_SIMD, linked with
+    only the UMAMI functions exported. precision "split": the split kernels (kernelA, kernelB) and PAC_SIMD_SPLIT"""
     if int(provider["particle_count"]) != l.legs:
         raise UmamiError(f"{lib.process} {lib.colour}: the provider has {provider['particle_count']} particles, "
                          f"the program {l.legs} legs")
@@ -313,7 +317,7 @@ def build_umami_simd(dir, lib: UmamiLibrary, l: Lowered, provider: dict, exporte
     dir = Path(dir)
     l = permuted(l, lib.permutation)   # the library reads the caller's legs
     try:
-        codegen.compile_simd(dir, l, isa=ISAS[device], precision=precision)
+        codegen.compile_simd(dir, l, isa=ISAS.get(device), precision=precision, scalar=device == CPU_JIT)
     except codegen.CompileError as e:
         raise UmamiError(f"{lib.process} {lib.colour}: {e}") from e
     (tables, program) = umami_program_h(lib, l, provider, exported_count, parameters)
@@ -348,7 +352,7 @@ def build_umami_library(dir, lib: UmamiLibrary, l: Lowered, provider: dict, expo
     CPU) of `gpu_memory` device bytes each (a call needing more runs as several launches). precision
     "mixed" (a CUDA device only): pacops.h's PAC_MIXED, not the CPU's bits, so nvcc may contract
     multiply-adds unless fmad = False. device "metal" (macOS): build_umami_metal (always mixed f32/df64).
-    a SIMD device (simd-avx2, simd-avx512, simd-neon; precision f64 or split): build_umami_simd."""
+    a SIMD device (simd-avx2, simd-avx512, simd-neon; precision f64 or split) or cpu-jit (f64): build_umami_simd."""
     try:
         device, precision = _env.compile_target(device, precision)
     except _env.PacRunnerError as e:
@@ -356,7 +360,7 @@ def build_umami_library(dir, lib: UmamiLibrary, l: Lowered, provider: dict, expo
     if device == "metal":
         return build_umami_metal(dir, lib, l, provider, exported_count, parameters, cc=cc, cflags=cflags,
                                  runtime_dir=runtime_dir)
-    if device in SIMD_DEVICES:
+    if device in SIMD_DEVICES or device == CPU_JIT:
         return build_umami_simd(dir, lib, l, provider, exported_count, parameters, cc=cc, cflags=cflags,
                                 device=device, precision=precision)
     fmad = precision == "mixed" if fmad is None else fmad

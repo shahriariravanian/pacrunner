@@ -9,6 +9,8 @@ Variants (the suite "cpu" is "full" without the GPU ones; a variant runs where t
 
   stock                 the output's stock pyAmpliCol library (bin/generate_events)
   cpu                   PacRunner's C runner, f64
+  cpu-jit               the CPU runner made by symjit: the SIMD kernel's application as symjit's scalar code, f64
+                        (cpu's bits; where a SIMD device builds)
   simd-avx2, simd-neon  one symjit SIMD kernel per program (AVX2 on x86-64, NEON on aarch64), f64
   simd-split-avx2, simd-split-neon   the split kernels (f64 kernel A, f32 kernel B)
   simd-avx512, simd-split-avx512     the same with AVX-512 (x86-64 CPUs that have it)
@@ -40,6 +42,7 @@ import time
 VARIANTS = {
     "stock": (None, None, None, False),
     "cpu": ("cpu", "f64", None, False),
+    "cpu-jit": ("cpu-jit", "f64", "cpu-jit", False),
     "simd-avx2": ("simd-avx2", "f64", "simd-avx2", False),
     "simd-neon": ("simd-neon", "f64", "simd-neon", False),
     "simd-split-avx2": ("simd-avx2", "split", "simd-avx2", False),
@@ -81,6 +84,8 @@ def have(need):
         return True
     if need.startswith("simd-"):
         return need in _env.simd_devices()
+    if need == "cpu-jit":
+        return bool(_env.simd_devices())
     if need == "metal":
         return sys.platform == "darwin"
     cuda = sys.platform != "darwin" and shutil.which("nvcc") is not None and shutil.which("nvidia-smi") is not None

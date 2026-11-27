@@ -231,10 +231,12 @@ class Artifact:
         """PacRunner's UMAMI libraries of this provider: the export (export()), then umami_libraries
         (pacrunner.umami) into `folder` (default: default_folder()); returns the Provider. Skipped when
         `folder` holds libraries of the same artifact, provider, parameters, device, precision, pacrunner
-        revision and symjit (its pacrunner-build.json), unless `force`. device: "cpu", "cuda" (an NVIDIA GPU, a
+        revision and symjit (its pacrunner-build.json), unless `force`. device: "cpu", "cpu-jit" (the CPU runner
+        made by symjit: a SIMD device's kernel as scalar code, the cpu bits), a SIMD device ("simd-avx2", "simd-avx512",
+        "simd-neon", "simd"), "cuda" (an NVIDIA GPU, a
         CPU provider), "metal" (an Apple GPU, a CPU provider, macOS; always mixed f32/df64), "gpu" (this
         system's: metal on macOS, cuda elsewhere), "cuda_provider" or its alias "cuda_full" (MadSpace's GPU
-        runtime); precision "f64" or "mixed" (a GPU device)."""
+        runtime); precision "f64", "mixed" (a GPU device) or "split" (a SIMD device)."""
         from .kernels import require_symjit, symjit_fingerprint
         from .umami import umami_libraries
         require_symjit()   # symjit >= 2.29, before the export

@@ -202,7 +202,7 @@ class Umami(unittest.TestCase):
             export, m = SETS[name]
             with tempfile.TemporaryDirectory() as out:
                 tables = {}
-                for device in ("cpu", *DEVICES):
+                for device in ("cpu", *DEVICES, "cpu-jit"):
                     path = umami.umami_libraries(export, m["metadata"], Path(out) / device, device=device, quiet=True)
                     tables[device] = json.loads(Path(path).read_text())
                     self.assertEqual(tables[device]["device"], device)
@@ -218,7 +218,7 @@ class Umami(unittest.TestCase):
                     cpu = Library_(Path(out) / "cpu" / entry["path"])
                     want = [cpu.call(p, random=random), cpu.call(p, fixed=fixed)]
                     cpu.close()
-                    for device in DEVICES:
+                    for device in (*DEVICES, "cpu-jit"):
                         with self.subTest(export=name, library=k, device=device):
                             simd = Library_(Path(out) / device / tables[device]["libraries"][k]["path"])
                             got = [simd.call(p, random=random), simd.call(p, fixed=fixed)]
@@ -262,6 +262,31 @@ class Objects(unittest.TestCase):
                                    app["program"]["builder"]["count_stack"] * 8 * n)
                 self.assertIn(f"#define PAC_SIMD_ISA_{isa.upper()} 1", (Path(d) / "runner.h").read_text())
 
+    def test_cpu_jit_object_is_the_scalar_code(self):
+        import symjit
+        export, m = SETS["zgg"]
+        prog = uir.optimize(uir.load_recurrence_export(export)[0])
+        isa = _env.cpu_jit_isa()
+        with tempfile.TemporaryDirectory() as d:
+            codegen.compile_simd(d, prog, scalar=True)
+            app = json.loads((Path(d) / "kernel.json").read_text())
+            simd_app, _ = simd_application(prog, isa=isa)     # the SIMD device's application
+            self.assertEqual(len(app["mir"]["code"]), len(simd_app["mir"]["code"]))
+            symjit.load_json(json.dumps(app)).dump(str(Path(d) / "jit.bin"), "scalar")
+            jit = (Path(d) / "jit.bin").read_bytes()
+            if isa == "neon":
+                self.assertEqual((Path(d) / "kernel.bin").read_bytes(), jit)
+            else:
+                self.assertEqual((Path(d) / "kernel.o").read_bytes()[4096:4096 + len(jit)], jit)
+            h = (Path(d) / "kernel.h").read_text()
+            self.assertIn("#define PAC_KERNEL_LANES 1", h)
+            self.assertIn("A scalar kernel (1 lane)", h)
+            r = (Path(d) / "runner.h").read_text()
+            self.assertIn('#define PAC_SIMD_DEVICE "cpu-jit"', r)
+            self.assertIn(f"#define PAC_SIMD_ISA_{isa.upper()} 1", r)
+            with self.assertRaisesRegex(SimdError, "f64 only"):
+                codegen.compile_simd(d, prog, precision="split", scalar=True)
+
     def test_another_machine_s_device_is_refused(self):
         export, m = SETS["zgg"]
         other = [d for d in _env.SIMD_DEVICES if d not in DEVICES]
@@ -299,20 +324,36 @@ class Units(unittest.TestCase):
                 _env.compile_target("cuda", "split")
             with self.assertRaisesRegex(_env.PacRunnerError, "needs a GPU device"):
                 _env.compile_target("cpu", "mixed")
+            self.assertEqual(_env.compile_target("cpu-jit"), ("cpu-jit", "f64"))
+            self.assertEqual(_env.library_name("cpu-jit"), "cpu-jit")
+            self.assertEqual(_env.cpu_jit_isa(), "avx2")      # avx2's fragments also where AVX-512 is
+            with self.assertRaisesRegex(_env.PacRunnerError, "f64 only"):
+                _env.compile_target("cpu-jit", "split")
+            with self.assertRaisesRegex(_env.PacRunnerError, "f64 only"):
+                _env.compile_target("cpu-jit", "mixed")
         with self.machine("x86_64", "sse avx2 fma"):
             self.assertEqual(_env.device_name("simd"), "simd-avx2")
+            self.assertEqual(_env.cpu_jit_isa(), "avx2")
             with self.assertRaisesRegex(_env.PacRunnerError, "does not build on this machine"):
                 _env.compile_target("simd-avx512")
         for arm in ("aarch64", "arm64"):
             with self.machine(arm):
                 self.assertEqual(_env.compile_target("simd-split"), ("simd-neon", "split"))
                 self.assertEqual(_env.library_name("simd-neon-split"), "simd-neon-split")
+                self.assertEqual(_env.compile_target("cpu-jit"), ("cpu-jit", "f64"))
+                self.assertEqual(_env.cpu_jit_isa(), "neon")
                 with self.assertRaisesRegex(_env.PacRunnerError, "does not build on this machine"):
                     _env.compile_target("simd-avx2")
         with self.machine("riscv64"):
             self.assertEqual(_env.simd_devices(), ())
             with self.assertRaisesRegex(_env.PacRunnerError, "device 'simd'"):
                 _env.compile_target("simd")
+            with self.assertRaisesRegex(_env.PacRunnerError, "does not build on this machine"):
+                _env.compile_target("cpu-jit")
+            self.assertIsNone(_env.cpu_jit_isa())
+        with self.machine("x86_64", "sse avx"):     # no AVX2: no SIMD device, no cpu-jit
+            with self.assertRaisesRegex(_env.PacRunnerError, "does not build on this machine"):
+                _env.compile_target("cpu-jit")
 
     def test_simd_needs_a_simd_device(self):
         if not (SETS and HAVE_SYMJIT):

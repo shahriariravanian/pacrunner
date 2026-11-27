@@ -848,6 +848,7 @@ def simd_application(prog: Lowered, call=called, isa: Optional[str] = None) -> t
 # ---- the folder --------------------------------------------------------------------------------------------
 
 ISAS = {"simd-avx2": "avx2", "simd-avx512": "avx512", "simd-neon": "neon"}   # device -> instruction set
+CPU_JIT = "cpu-jit"     # _env.CPU_JIT: compile_simd(..., scalar=True)'s device
 LANES = {"avx2": 4, "avx512": 8, "neon": 2}                                 # its f64 lanes
 NEEDS = {"avx2": "an x86-64 CPU with AVX2 and FMA", "avx512": "an x86-64 CPU with AVX-512 (F, DQ)",
          "neon": "an aarch64 CPU"}
@@ -873,15 +874,18 @@ def _isa(isa: Optional[str]) -> str:
     return isa
 
 
-def runner_h(prog: Lowered, isa: str, split: bool = False) -> str:
-    n = LANES[isa]
+def runner_h(prog: Lowered, isa: str, split: bool = False, scalar: bool = False) -> str:
+    """runner.h of a compile_simd folder; scalar: device cpu-jit's (the scalar kernel, one lane)"""
+    n = 1 if scalar else LANES[isa]
     if split:      # the split kernels: A (f64) n lanes, B (f32) 2 n
         what = f"kernelA.h, kernelB.h: pac_kernel_a (f64, {n} lanes), pac_kernel_b (f32, {2 * n} lanes); A: states " \
                "the momenta, outputs the transfers; B: states the transfers, outputs the helicity outputs"
     else:
-        what = f"kernel.h: pac_kernel ({n} lanes); states the momenta, outputs the helicity outputs"
+        what = f"kernel.h: pac_kernel ({n} lane{'' if n == 1 else 's'}); states the momenta, outputs the helicity outputs"
+    device = CPU_JIT if scalar else f"simd-{isa}{'-split' if split else ''}"
+    kind = f"symjit's scalar kernel of simd-{isa}'s application" if scalar else f"SIMD kernels (simd-{isa})"
     return f"""\
-/* {prog.process} {prog.colour}: the program as SIMD kernels (simd-{isa}), by PacRunner's compile_simd
+/* {prog.process} {prog.colour}: the program as {kind}, by PacRunner's compile_simd
  * ({what}). */
 #ifndef RUNNER_H
 #define RUNNER_H
@@ -892,7 +896,7 @@ def runner_h(prog: Lowered, isa: str, split: bool = False) -> str:
 #define RUNNER_OUTPUTS {prog.output_count()}
 #define RUNNER_ARENA_SIZE {ArenaIndex.of(prog).size}
 #define PAC_SIMD_ISA_{isa.upper()} 1
-#define PAC_SIMD_DEVICE "simd-{isa}{'-split' if split else ''}"
+#define PAC_SIMD_DEVICE "{device}"
 #define PAC_SIMD_NEEDS "{NEEDS[isa]}"
 {'#define PAC_SIMD_SPLIT 1' if split else ''}
 #endif
@@ -939,16 +943,21 @@ def jit_kernel(app: dict, isa: str, what: str, folder) -> bytes:
     return code
 
 
-def compile_simd(path, prog: Lowered, isa: Optional[str] = None, precision: str = "f64"):
+def compile_simd(path, prog: Lowered, isa: Optional[str] = None, precision: str = "f64", scalar: bool = False):
     """the folder of `prog` (see the module) for the instruction set `isa` ("avx2", "avx512", "neon";
     default host_isa()); returns `path`. The kernel: kernel.o (x86-64) or kernel.S + kernel.bin (aarch64),
-    pac_kernel, kernel.h. precision "split": the split kernels (compile_simd_split)"""
+    pac_kernel, kernel.h. precision "split": the split kernels (compile_simd_split). scalar: device cpu-jit's
+    folder: the same application (isa's fragments, default _env.cpu_jit_isa()), but symjit's scalar kernel of it
+    (dump "scalar"), one event a call: the cpu runner's bits, from symjit's code instead of the C compiler's"""
     if precision in ("split", "mixed"):
+        if scalar:
+            raise SimdError("device cpu-jit is f64 only")
         return compile_simd_split(path, prog, isa)
     if precision != "f64":
         raise SimdError(f"precision {precision!r}: f64 or split")
+    from .. import _env
     from ..simd import elf
-    isa = _isa(isa)
+    isa = _isa(isa or (_env.cpu_jit_isa() if scalar else None))
     path = Path(path)
     path.mkdir(parents=True, exist_ok=True)
     app, _ = simd_application(prog, isa=isa)
@@ -956,12 +965,14 @@ def compile_simd(path, prog: Lowered, isa: Optional[str] = None, precision: str 
         app = plain_calls(app)
     elf.no_relocations(app["mir"]["code"])
     (path / "kernel.json").write_text(json.dumps(app))
-    (path / "runner.h").write_text(runner_h(prog, isa))
-    code = jit_kernel(app, isa, "simd", path)
+    (path / "runner.h").write_text(runner_h(prog, isa, scalar=scalar))
+    code = jit_kernel(app, isa, "scalar" if scalar else "simd", path)
     elf.write_object(path, "kernel", "pac_kernel", code, isa)
-    n = LANES[isa]
+    n = 1 if scalar else LANES[isa]
+    what = f"{prog.process} {prog.colour}, " + (f"{CPU_JIT} (symjit's scalar kernel, simd-{isa}'s application)"
+                                                if scalar else f"simd-{isa}")
     (path / "kernel.h").write_text(elf.header("pac_kernel", n, app["program"]["count_states"], app["program"]["count_obs"],
-                                              elf.stack_bytes(app, n), f"{prog.process} {prog.colour}, simd-{isa}"))
+                                              elf.stack_bytes(app, n), what))
     return path
 
 

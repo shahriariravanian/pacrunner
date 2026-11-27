@@ -22,7 +22,10 @@ REPOSITORY = PACKAGE.parent
 
 # the SIMD devices: one symjit kernel per program, for one instruction set (its f64 lanes)
 SIMD_DEVICES = {"simd-avx2": 4, "simd-avx512": 8, "simd-neon": 2}
-DEVICES = ("cpu", *SIMD_DEVICES, "cuda", "cuda_provider", "metal")
+# cpu-jit: the CPU runner made by symjit: the SIMD devices' kernel of a program (simd-avx2's on x86-64, simd-neon's on
+# aarch64) as symjit's scalar kernel, one event a call; f64, the cpu runner's bits; builds where a SIMD device does
+CPU_JIT = "cpu-jit"
+DEVICES = ("cpu", CPU_JIT, *SIMD_DEVICES, "cuda", "cuda_provider", "metal")
 # cuda_full: everything on the GPU (MadSpace's GPU runtime); simd: this machine's SIMD device (simd_device)
 DEVICE_ALIASES = {"cuda_full": "cuda_provider", "simd": None}
 # f64; mixed: a GPU's f32 currents (Metal: f32/df64); split: a SIMD device's split kernels (f64 + f32)
@@ -44,8 +47,8 @@ def compile_target(device: str, precision: str = "f64") -> tuple[str, str]:
     """(device, precision) of a build: the device's own name (device_name), and for metal always
     "mixed" (Metal has no f64: mixed f32/df64). A SIMD device's name may carry its precision
     ("simd-avx2-split", "simd-split"); "mixed" on a SIMD device is "split" (its former name). An
-    unknown device or precision, metal off macOS, or a SIMD device this machine cannot build (symjit's
-    JIT compiles the kernels: simd_devices), is a PacRunnerError"""
+    unknown device or precision, metal off macOS, or a SIMD device (or cpu-jit, f64 only) this machine
+    cannot build (symjit's JIT compiles the kernels: simd_devices), is a PacRunnerError"""
     if device.endswith("-split") and device != "-split":
         device, precision = device[:-len("-split")], "split"
     name = device_name(device)
@@ -66,11 +69,25 @@ def compile_target(device: str, precision: str = "f64") -> tuple[str, str]:
         if precision == "mixed":
             precision = "split"
         return name, precision
+    if name == CPU_JIT:
+        if not simd_devices():
+            raise PacRunnerError(f"device {CPU_JIT!r} does not build on this machine ({platform.machine()}): symjit's JIT "
+                                 "compiles its kernels, as a SIMD device's (x86-64 with AVX2 and FMA, or aarch64)")
+        if precision != "f64":
+            raise PacRunnerError(f"device {CPU_JIT!r} is f64 only (precision {precision!r}: a SIMD or GPU device)")
+        return name, precision
     if precision == "split":
         raise PacRunnerError(f"precision 'split' needs a SIMD device ({', '.join(SIMD_DEVICES)}, simd)")
     if precision != "f64" and name == "cpu":
         raise PacRunnerError(f"precision {precision!r} needs a GPU device (cuda, cuda_provider, metal) or a SIMD device")
     return name, precision
+
+
+def cpu_jit_isa() -> str | None:
+    """the instruction set of the SIMD kernel whose scalar code device cpu-jit runs: avx2 on x86-64 (its fragments
+    use 14 registers, which scalar code has too), neon on aarch64; None where no SIMD device builds"""
+    here = simd_devices()
+    return None if not here else ("neon" if here[0] == "simd-neon" else "avx2")
 
 
 def library_name(device: str, precision: str = "f64") -> str:
