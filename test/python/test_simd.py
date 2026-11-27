@@ -206,6 +206,7 @@ class Umami(unittest.TestCase):
                     path = umami.umami_libraries(export, m["metadata"], Path(out) / device, device=device, quiet=True)
                     tables[device] = json.loads(Path(path).read_text())
                     self.assertEqual(tables[device]["device"], device)
+                    self.assertIsNone(tables[device]["gpu_memory"])   # no GPU (the table's GPU fields)
                 meta = json.loads(Path(m["metadata"]).read_text())
                 helicities = len(meta["helicities"])
                 for k, entry in enumerate(tables["cpu"]["libraries"]):
@@ -227,6 +228,50 @@ class Umami(unittest.TestCase):
                                 self.assertTrue(np.array_equal(g[0].view(np.uint64), w[0].view(np.uint64)))
                                 self.assertTrue(np.array_equal(g[1], w[1]))
                                 self.assertTrue(np.array_equal(g[2], w[2]))
+
+
+    def test_a_thread_with_too_small_a_stack_is_refused(self):
+        """the kernel's frame lives on the calling thread's stack: too little left is UMAMI_ERROR, not a crash"""
+        import threading
+        export, m = SETS["zgg"]
+        device = DEVICES[-1]                        # the widest lanes: the largest frame
+        with tempfile.TemporaryDirectory() as out:
+            table = json.loads(Path(umami.umami_libraries(export, m["metadata"], out, device=device, quiet=True)).read_text())
+            path = Path(out) / table["libraries"][0]["path"]
+            h = (path.parent / "kernel.h").read_text()
+            need = int(re.search(r"PAC_KERNEL_STACK_BYTES (\d+)", h).group(1)) + 16384   # PAC_SIMD_STACK_MARGIN
+            small = 32768                               # threading's least stack
+            if need <= small:
+                self.skipTest(f"zgg's {device} kernel needs only {need} bytes")
+            n = int(table["particle_count"])
+            p3 = np.random.default_rng(5).uniform(-300, 300, (8, n, 3))
+            p = np.concatenate([np.linalg.norm(p3, axis=2)[:, :, None], p3], axis=2)
+            lib = Library_(path)
+            want = lib.call(p, random=np.full(8, 0.5))[0]
+
+            def in_thread(stack):
+                result = {}
+
+                def body():
+                    try:
+                        result["me"] = lib.call(p, random=np.full(8, 0.5))[0]
+                    except RuntimeError as e:
+                        result["error"] = str(e)
+                old = threading.stack_size(stack)
+                try:
+                    t = threading.Thread(target=body)
+                    t.start()
+                    t.join()
+                finally:
+                    threading.stack_size(old)
+                return result
+
+            refused = in_thread(small)
+            self.assertIn("umami_matrix_element: 1", refused.get("error", ""), refused)   # UMAMI_ERROR
+            ok = in_thread(max(16 << 20, need * 4))
+            self.assertNotIn("error", ok)
+            self.assertTrue(np.array_equal(ok["me"].view(np.uint64), want.view(np.uint64)))
+            lib.close()
 
 
 @unittest.skipUnless(SETS and HAVE_SYMJIT and DEVICES, "no corpus, symjit >= 2.29, or a SIMD device")

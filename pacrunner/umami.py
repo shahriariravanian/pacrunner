@@ -335,7 +335,7 @@ def build_umami_simd(dir, lib: UmamiLibrary, l: Lowered, provider: dict, exporte
         raise UmamiError(f"{lib.process} {lib.colour}: compile_simd wrote no kernel objects in {dir}")
     flag = ["-DPAC_SIMD_SPLIT"] if precision == "split" else []
     _run([*cc, *_flags(cflags), "-std=c99", "-ffp-contract=off", "-fPIC", "-fvisibility=hidden", "-DPAC_SIMD",
-          *flag, "-shared", *hide, "-o", so, dir / "umami_pac.c", *objects, "-lm"])
+          *flag, "-shared", *hide, "-o", so, dir / "umami_pac.c", *objects, "-lm", "-pthread"])   # the stack check
     return str(so)
 
 
@@ -567,7 +567,7 @@ def umami_libraries(export, metadata, dir, *, optimize_programs: bool = True, in
             raise
     table = {
         "kind": "pacrunner-umami-libraries", "schema_version": 1, "device": device, "precision": precision,
-        "gpu_slots": gpu_slots if device == "cuda" else None, "gpu_memory": None if device == "cpu" else gpu_memory,
+        "gpu_slots": gpu_slots if device == "cuda" else None, "gpu_memory": gpu_memory if device in GPU_DEVICES else None,
         "artifact_id": d["artifact_id"], "export": export_path, "metadata": os.path.abspath(metadata),
         "particle_count": provider["particle_count"],
         "libraries": [library_entry(k, lib, os.path.relpath(so, dir)) for k, (lib, so) in enumerate(zip(libraries, sos))],

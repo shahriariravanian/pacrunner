@@ -59,8 +59,11 @@
  * its last event to a multiple of the lanes), the kernel on 4, 8 or 2 events per call, then each event's
  * end (pac_finish) on its column of outputs. The checks, the scales and the end are the CPU build's, and
  * the kernel computes runner.c's values: the CPU build's bits. A kernel call uses PAC_KERNEL_STACK_BYTES
- * of the calling thread's stack. The kernels are symjit's JIT code in object files (compile_simd,
- * simd/elf.py): no relocations, no library calls.
+ * of the calling thread's stack (its frame holds the arena): each call checks that the thread has that much
+ * left, with PAC_SIMD_STACK_MARGIN to spare, and returns UMAMI_ERROR with a message on stderr if not, before
+ * any event (simd_stack_ok; where the stack's extent cannot be found, the call goes ahead). The kernels are
+ * symjit's JIT code in object files (compile_simd, simd/elf.py): no relocations, no library calls.
+ * Device cpu-jit is the same with symjit's scalar kernel: one lane.
  *
  * With PAC_SIMD and PAC_SIMD_SPLIT (precision "split": device "simd-avx2-split" and so on) the kernels
  * are the split ones, two a chunk (compile_simd(precision = "split"), codegen/compile_split.py): kernel A
@@ -68,6 +71,9 @@
  * sources, the model kernels' wide values), rounded to floats, then kernel B in f32 (kernelB,
  * pac_kernel_b: symjit's f32 twin, twice the lanes; float columns: it reads element idx at byte 8 idx,
  * called with idx / 2) to the outputs, widened for the event's end. */
+#if defined(PAC_SIMD) && defined(__linux__) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE   /* pthread_getattr_np: the calling thread's stack (simd_stack_ok) */
+#endif
 #include "umami.h"
 #include "runner.h"
 #include <math.h>
@@ -98,6 +104,16 @@
 #if PAC_SIMD_CHUNK % PAC_SIMD_LANES != 0
 #error "PAC_SIMD_CHUNK must be a multiple of the kernel's lanes"
 #endif
+#if defined(PAC_SIMD_SPLIT)                            /* the larger frame of the two kernels */
+#define PAC_SIMD_STACK_BYTES (PAC_KERNEL_A_STACK_BYTES > PAC_KERNEL_B_STACK_BYTES ? PAC_KERNEL_A_STACK_BYTES \
+                                                                                   : PAC_KERNEL_B_STACK_BYTES)
+#else
+#define PAC_SIMD_STACK_BYTES PAC_KERNEL_STACK_BYTES
+#endif
+#ifndef PAC_SIMD_STACK_MARGIN
+#define PAC_SIMD_STACK_MARGIN 16384                    /* bytes for the frames between the check and the kernel */
+#endif
+#include <pthread.h>
 #endif
 
 typedef struct {
@@ -149,6 +165,44 @@ static bool simd_cpu(void) {
 #else
     return false;
 #endif
+}
+
+/* the lowest address of the calling thread's stack (stacks grow down on x86-64 and aarch64), found once per
+   thread; 0 where it cannot be found */
+static __thread uintptr_t stack_low;
+static __thread bool stack_known;
+
+static uintptr_t thread_stack_low(void) {
+    if (!stack_known) {
+        stack_known = true;
+#if defined(__APPLE__)
+        pthread_t self = pthread_self();
+        stack_low = (uintptr_t)pthread_get_stackaddr_np(self) - (uintptr_t)pthread_get_stacksize_np(self);
+#elif defined(__linux__)
+        pthread_attr_t attr;
+        void *addr = NULL;
+        size_t size = 0;
+        if (pthread_getattr_np(pthread_self(), &attr) == 0) {
+            if (pthread_attr_getstack(&attr, &addr, &size) == 0) stack_low = (uintptr_t)addr;
+            pthread_attr_destroy(&attr);
+        }
+#endif
+    }
+    return stack_low;
+}
+
+/* whether the calling thread's stack has room for a kernel call (PAC_SIMD_STACK_BYTES and the margin);
+   a message on stderr if not. Unknown extent: true */
+static bool simd_stack_ok(void) {
+    char here;
+    uintptr_t low = thread_stack_low(), sp = (uintptr_t)&here;
+    size_t const need = (size_t)PAC_SIMD_STACK_BYTES + PAC_SIMD_STACK_MARGIN;
+    if (low == 0 || sp <= low || sp - low >= need) return true;
+    fprintf(stderr, "umami (%s %s): device %s needs %zu bytes of the calling thread's stack (its kernel's %zu and "
+            "%d to spare); this thread has %zu left: call it from a thread with a larger stack\n", RUNNER_PROCESS,
+            RUNNER_COLOUR, PAC_SIMD_DEVICE, need, (size_t)PAC_SIMD_STACK_BYTES, PAC_SIMD_STACK_MARGIN,
+            (size_t)(sp - low));
+    return false;
 }
 
 static bool simd_setup(Instance *instance) {
@@ -385,6 +439,9 @@ PAC_EXPORT UmamiStatus umami_matrix_element(UmamiHandle handle, size_t count, si
     }
     if (count == 0) return UMAMI_SUCCESS;
     if (in[UMAMI_IN_MOMENTA] == NULL) return UMAMI_ERROR_MISSING_INPUT;
+#ifdef PAC_SIMD
+    if (!simd_stack_ok()) return UMAMI_ERROR;   /* before any event: nothing written */
+#endif
     Instance *instance = handle;
 #ifdef PAC_CUDA_PROVIDER
     /* device pointers: everything happens on the stream; an earlier call's failing event first */
