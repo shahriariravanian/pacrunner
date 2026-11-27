@@ -266,6 +266,9 @@ this process): the colour approximation, not a GPU difference.
 
 ## Benchmarks
 
+The scripts that measure these are in [`bench/`](bench/README.md): `bench/bench_full.sh` (every CPU, SIMD
+and GPU variant this machine runs) and `bench/bench_cpu.sh` (without the GPU), on five processes.
+
 `u u~ > z g g g g`, one MadGraph7 `generate_events` run of 100k events per mode, on three machines.
 
 **Wall clock (s)**
