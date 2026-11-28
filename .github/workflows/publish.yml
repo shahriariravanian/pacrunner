@@ -1,0 +1,88 @@
+# PacRunner on PyPI: one pure-Python wheel (py3-none-any; the C sources and SIMD fragments are package data,
+# compiled on the user's machine) and the sdist. Built and checked on pull requests that change the packaging;
+# uploaded to PyPI when a GitHub release is published (trusted publishing: PyPI project `pacrunner`, this
+# workflow `publish.yml`, environment `pypi`; no token is stored).
+name: publish
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/publish.yml
+      - pyproject.toml
+      - MANIFEST.in
+      - pacrunner/__init__.py
+  workflow_dispatch:
+  release:
+    types: [published]
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install build twine check-wheel-contents
+      - run: python -m build
+      - run: twine check --strict dist/*
+      - run: check-wheel-contents dist/*.whl
+      - name: the version is the release tag's (v0.5.1 for 0.5.1)
+        if: github.event_name == 'release'
+        run: |
+          version=$(python -c "import tomllib; print(tomllib.load(open('pyproject.toml', 'rb'))['project']['version'])")
+          test "v$version" = "${{ github.event.release.tag_name }}" || { echo "pyproject.toml says $version, the tag is ${{ github.event.release.tag_name }}"; exit 1; }
+          test "$(python -c "import ast, sys; t = ast.parse(open('pacrunner/__init__.py').read()); print(next(n.value.value for n in t.body if isinstance(n, ast.Assign) and n.targets[0].id == '__version__'))")" = "$version"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  install:
+    # the wheel installs with its requirements from PyPI and carries its C sources and fragments
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-15]
+        python: ["3.10", "3.12", "3.13"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: python -m pip install dist/*.whl
+      - name: import from outside any checkout
+        working-directory: ${{ runner.temp }}
+        run: |
+          python - <<'PY'
+          import pacrunner, symjit
+          from pacrunner import _env
+          from importlib.metadata import version
+          print("pacrunner", pacrunner.__version__, pacrunner.__file__, "symjit", version("symjit"))
+          assert _env.repository() is None, "an installed copy, not a clone"
+          for f in ("umami_pac.c", "pacops.c", "umami.h", "UMAMI_LICENSE", "cuda/pool.h"):
+              assert (_env.C_DIR / f).is_file(), f
+          for lib in ("lib", "lib_hand_avx2", "lib_hand_avx512", "lib_hand_neon"):
+              n = len(list((_env.PACKAGE / "simd" / lib).glob("*.json")))
+              assert n > 0, lib
+              print(lib, n, "fragments")
+          PY
+
+  publish:
+    if: github.event_name == 'release'
+    needs: [build, install]
+    runs-on: ubuntu-24.04
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+      - uses: pypa/gh-action-pypi-publish@release/v1

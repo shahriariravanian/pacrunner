@@ -27,13 +27,13 @@ generators and [MadGraph](https://github.com/MadGraphTeam/MadGraph7) ecosystem.
        -Ccmake.define.ENABLE_OPENBLAS=ON -Ccmake.build-type=Release .
    ```
    `device="cuda"` does not need it (the matrix elements on the GPU, MadSpace on the CPU).
-4. Optionally, install symjit 2.29 or later from conda-forge: `conda install -c conda-forge 'symjit>=2.29'`.
-   symjit is a pip requirement of PacRunner (`symjit>=2.29`): step 6 keeps a conda symjit that
-   satisfies it, and otherwise installs symjit from PyPI.
-5. Clone PacRunner: `git clone https://github.com/shahriariravanian/pacrunner`, then `cd pacrunner`.
-6. Install it, editable: `python -m pip install -e .` (a plain `python -m pip install .` works too: the C
-   sources, `pacrunner/c/`, are package data; editable is for working on PacRunner).
-7. Point PacRunner at the MadGraph7 checkout: `export PACRUNNER_MADGRAPH7=/path/to/MadGraph7`, or
+4. Install PacRunner from PyPI: `python -m pip install pacrunner`, or `python -m pip install "pacrunner[cuda]"`
+   for the CUDA devices (it adds CuPy). numpy and symjit (2.29.3 or later) come with it; to use conda-forge's
+   symjit, install it first (`conda install -c conda-forge 'symjit>=2.29.3'`) and pip keeps it.
+5. Or, to work on PacRunner itself, install it from a clone, editable:
+   `git clone https://github.com/shahriariravanian/pacrunner`, `cd pacrunner`, then `python -m pip install -e .`
+   (the tests and the tutorial are in the clone, not in the PyPI package).
+6. Point PacRunner at the MadGraph7 checkout: `export PACRUNNER_MADGRAPH7=/path/to/MadGraph7`, or
    `pacrunner.configure(madgraph7="/path/to/MadGraph7")` before the first runtime. PacRunner then
    imports MadSpace from `madspace/install-cuda` when it exists and from `madspace/install` otherwise
    (`configure(cuda=False)`: the CPU build), and finds pyAmpliCol in `pyamplicol/install`. Do not put
@@ -41,8 +41,8 @@ generators and [MadGraph](https://github.com/MadGraphTeam/MadGraph7) ecosystem.
    switched (`configure` then fails with "MadSpace is already loaded in this process"). Without
    either setting, PacRunner uses the MadGraph7 an mg7 output was made with, or a `madspace`
    installed in the python.
-8. Optional tests: `python -m unittest discover -s test/python` (see [Tests](#tests)).
-9. Set `export NVCC=path/to/nvcc` (optional, should be needed only if CUDA is installed in a non-standard location).
+7. Optional tests, in a clone: `python -m unittest discover -s test/python` (see [Tests](#tests)).
+8. Set `export NVCC=path/to/nvcc` (optional, should be needed only if CUDA is installed in a non-standard location).
 
 You also need a C compiler (`cc`, or `CC`), and `nvcc` for the GPU devices.
   
@@ -273,7 +273,7 @@ this process): the colour approximation, not a GPU difference.
 
 ## Benchmarks
 
-The scripts that measure these are in [`bench/`](bench/README.md): `bench/bench_full.sh` (every CPU, SIMD
+The scripts that measure these are in [`bench/`](https://github.com/shahriariravanian/pacrunner/blob/main/bench/README.md): `bench/bench_full.sh` (every CPU, SIMD
 and GPU variant this machine runs) and `bench/bench_cpu.sh` (without the GPU), on five processes.
 
 `u u~ > z g g g g`, one MadGraph7 `generate_events` run of 100k events per mode, on three machines.

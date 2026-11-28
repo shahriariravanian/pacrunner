@@ -1,19 +1,39 @@
-# pacrunner: pyAmpliCol's recurrence programs as UMAMI libraries, installed from a clone of this
-# repository with `python -m pip install -e .` (or not editable: the C sources, pacrunner/c/, are package
-# data). symjit >= 2.29 is a requirement: pip keeps a conda-forge symjit that satisfies it, and
-# otherwise installs a PyPI wheel (correct for every Python >= 3.10 from 2.29.1). MadSpace and
-# pyAmpliCol come from a MadGraph7 checkout (pacrunner.configure).
+# pacrunner: pyAmpliCol's recurrence programs as UMAMI libraries. Installed from PyPI (`pip install pacrunner`,
+# `pacrunner[cuda]` for the CUDA runtimes) or from a clone (`python -m pip install -e .`). The wheel is pure Python:
+# the C sources (pacrunner/c/) and the SIMD fragments (pacrunner/simd/lib*/) are package data, compiled on the
+# user's machine. symjit >= 2.29.3: pip keeps a conda-forge symjit that satisfies it, else installs the PyPI wheel.
+# MadSpace and pyAmpliCol come from a MadGraph7 checkout (pacrunner.configure).
 [build-system]
-requires = ["setuptools>=64"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "pacrunner"
-version = "0.5.0"
+version = "0.5.1"
 description = "pyAmpliCol's LC recurrence programs as UMAMI libraries for MadGraph7/MadSpace (CPU, CUDA), from Python"
 readme = "README.md"
 requires-python = ">=3.10"
-dependencies = ["numpy", "symjit>=2.29"]
+dependencies = ["numpy", "symjit>=2.29.3"]
+license = "MIT"
+# pacrunner/c/UMAMI_LICENSE: MadGraph7's terms for the UMAMI headers shipped in pacrunner/c/
+license-files = ["LICENSE", "pacrunner/c/UMAMI_LICENSE"]
+authors = [{ name = "Shahriar Iravanian" }]
+keywords = ["MadGraph7", "MadSpace", "pyAmpliCol", "UMAMI", "matrix elements", "CUDA", "SIMD", "particle physics"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: C",
+    "Topic :: Scientific/Engineering :: Physics",
+]
+
+[project.urls]
+Homepage = "https://github.com/shahriariravanian/pacrunner"
+Source = "https://github.com/shahriariravanian/pacrunner"
+Issues = "https://github.com/shahriariravanian/pacrunner/issues"
 
 [project.optional-dependencies]
 cuda = ["cupy-cuda13x"]

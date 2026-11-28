@@ -31,7 +31,7 @@ permutation) it uses.
 
 from ._env import CONFIG, Config, PacRunnerError, configure, repository
 
-__version__ = "0.5.0"
+__version__ = "0.5.1"
 
 # imported on first use: `python -m pacrunner._madgraph` runs in MadGraph7's python, which may have
 # no numpy (nor symjit: only building libraries needs it)

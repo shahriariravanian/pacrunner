@@ -1,0 +1,6 @@
+# the sdist holds the package (pacrunner/, its C sources and fragments), README, LICENSE and pyproject.toml;
+# the tests, the tutorial, the benchmarks and the tools are in the repository only
+prune test
+prune tutorial
+prune bench
+prune tools
