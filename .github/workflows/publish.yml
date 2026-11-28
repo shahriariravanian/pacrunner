@@ -65,8 +65,11 @@ jobs:
           from importlib.metadata import version
           print("pacrunner", pacrunner.__version__, pacrunner.__file__, "symjit", version("symjit"))
           assert _env.repository() is None, "an installed copy, not a clone"
-          for f in ("umami_pac.c", "pacops.c", "umami.h", "UMAMI_LICENSE", "cuda/pool.h"):
+          for f in ("umami_pac.c", "pacops.c", "umami.h", "cuda/pool.h", "metal/uirmetal.m"):
               assert (_env.C_DIR / f).is_file(), f
+          from importlib.metadata import files
+          licenses = sorted(f.name for f in files("pacrunner") if "licenses" in f.parts)
+          assert licenses == ["LICENSE", "UMAMI_LICENSE"], licenses
           for lib in ("lib", "lib_hand_avx2", "lib_hand_avx512", "lib_hand_neon"):
               n = len(list((_env.PACKAGE / "simd" / lib).glob("*.json")))
               assert n > 0, lib

@@ -53,3 +53,7 @@ packages = ["pacrunner", "pacrunner.uir", "pacrunner.kernels", "pacrunner.codege
 "pacrunner.c" = ["*"]
 "pacrunner.c.cuda" = ["*"]
 "pacrunner.c.metal" = ["*"]
+
+[tool.setuptools.exclude-package-data]
+# UMAMI_LICENSE ships once, as a license file (license-files: the wheel's .dist-info/licenses/)
+"pacrunner.c" = ["UMAMI_LICENSE"]
